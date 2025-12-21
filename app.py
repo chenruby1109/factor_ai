@@ -76,9 +76,8 @@ def get_realtime_price_robust(stock_code):
 
 def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
     """
-    【Miniko V9.7 容錯修正版】
-    修正：解決 yfinance 抓取 ROIC 失敗導致好股票被過濾的問題。
-    策略：若無財報數據，改以技術面與基本估值(PE/PB)保底。
+    【Miniko V9.8 完美融合版】
+    邏輯：V9.7 的容錯機制 (避免抓不到資料報錯) + V9.6 的詳細文本與指標。
     """
     try:
         stock_name = name_map.get(ticker_symbol, ticker_symbol)
@@ -96,7 +95,7 @@ def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
         try:
             info = ticker.info
         except:
-            info = {} # 若抓不到，給空字典，不要 crash
+            info = {} 
         
         # --- 0. 基礎趨勢與意圖因子 ---
         days = 60
@@ -113,18 +112,18 @@ def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
         score_intent = 0
         is_intent_candidate = False
         
-        if v_variability > 0 and avg_volume > 500: # 門檻降低
+        if v_variability > 0 and avg_volume > 500: 
             raw_intent = s_return / v_variability
-            if 0 < s_return < 0.3: # 放寬漲幅限制
+            if 0 < s_return < 0.3: 
                 intent_factor = raw_intent
                 is_intent_candidate = True
                 score_intent = 15
             elif s_return < -0.05:
-                score_intent = 5 # 跌深不扣分
+                score_intent = 5 
 
         # --- 1. 機構大戶數據 (容錯版) ---
         
-        # 嘗試計算 ROIC，若無數據則標記 N/A
+        # ROIC
         roic = None
         try:
             ebitda = info.get('ebitda')
@@ -146,9 +145,9 @@ def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
                 fcf_yield = fcf / mkt_cap
         except: pass
 
-        # 替代指標：PB, PE (較容易取得)
+        # PEG & PB
+        peg_ratio = info.get('pegRatio')
         pb = info.get('priceToBook')
-        pe = info.get('trailingPE')
 
         # --- 2. CAPM ---
         stock_returns = close_series.pct_change().dropna()
@@ -163,24 +162,22 @@ def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
         
         ke = RF + beta * MRP 
 
-        # --- 3. 評分系統 (混合制：有資料算資料，沒資料算技術) ---
+        # --- 3. 評分系統 (混合制) ---
         score = 0
         factors = []
         
-        # A. 技術面保底 (確保主流股入榜)
+        # A. 技術面保底
         ma20 = close_series.rolling(20).mean().iloc[-1]
         ma60 = close_series.rolling(60).mean().iloc[-1]
         
-        if current_price > ma20: 
-            score += 20 # 只要站上月線就有基本分
-        if current_price > ma60:
-            score += 10
+        if current_price > ma20: score += 20 
+        if current_price > ma60: score += 10
             
         if is_intent_candidate: 
             score += score_intent
             factors.append("💎主力軌跡")
 
-        # B. 財務面 (有 ROIC 優先，沒有則看 PB)
+        # B. 財務面
         if roic is not None:
             if roic > 0.15: 
                 score += 25
@@ -188,12 +185,11 @@ def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
             elif roic > 0.08:
                 score += 15
         else:
-            # 如果抓不到 ROIC，改看 PB (替代方案)
             if pb and 0 < pb < 1.5:
                 score += 15
                 factors.append("低PB價值")
         
-        # C. 現金流 (有 FCF 優先)
+        # C. 現金流
         if fcf_yield is not None:
             if fcf_yield > 0.04:
                 score += 20
@@ -201,36 +197,47 @@ def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
         
         # D. 波動率
         volatility = stock_returns.std() * (252**0.5)
-        if volatility < 0.35:
-            score += 10
+        if volatility < 0.35: score += 10
         
-        # E. 估值保護 (Gordon)
+        # E. 估值保護
         div_rate = info.get('dividendRate')
         fair_value = np.nan
         if div_rate:
             k_minus_g = max(ke - G_GROWTH, 0.015)
             fair_value = div_rate / k_minus_g
 
-        # --- 4. 輸出 ---
-        # 只要分數 > 15 (非常寬鬆)，都回傳，由外層排序決定誰顯示
+        # --- 4. 生成詳細診斷文本 (恢復 V9.6 的詳細格式) ---
         if score >= 15: 
             
-            # 整理顯示文字
+            # 數據格式化 (處理 None)
             roic_str = f"{roic:.1%}" if roic is not None else "N/A"
             fcf_str = f"{fcf_yield:.1%}" if fcf_yield is not None else "N/A"
+            peg_str = f"{peg_ratio}" if peg_ratio else "N/A"
             
-            advice = ""
-            if roic and roic > ke: advice += "✅創造價值 "
-            if current_price > ma20: advice += "📈趨勢偏多 "
-            else: advice += "⚠️趨勢整理 "
+            # 1. 品質觀點
+            inst_view = ""
+            if roic and roic > ke: inst_view += "✅價值創造(ROIC>Ke)"
+            elif roic: inst_view += "⚠️資本效率待提升"
+            else: inst_view += "資料不足，改參考PB"
+
+            # 2. 技術觀點
+            path_diagnosis = f"趨勢向上 (+{s_return:.1%})" if s_return > 0 else f"趨勢修正 ({s_return:.1%})"
+            
+            # 組合最終建議 (V9.6 風格)
+            final_advice = (
+                f"📊 **AI 深度解析**：\n"
+                f"1. **品質**：ROIC {roic_str} | {inst_view}\n"
+                f"2. **估值**：FCF Yield {fcf_str} | PEG {peg_str}\n"
+                f"3. **技術**：{path_diagnosis} | Beta {beta:.2f}"
+            )
 
             return {
                 "代號": ticker_symbol.replace(".TW", "").replace(".TWO", ""),
                 "名稱": stock_name,
                 "現價": float(current_price),
                 "AI綜合評分": round(score, 1),
-                "AI綜合建議": advice,
-                "意圖因子": round(intent_factor, 2), # 補回意圖因子避免報錯
+                "AI綜合建議": final_advice, # 恢復詳細文本
+                "意圖因子": round(intent_factor, 2), 
                 "ROIC": roic_str, 
                 "FCF Yield": fcf_str,
                 "合理價": round(fair_value, 2) if not np.isnan(fair_value) else 0,
@@ -242,13 +249,47 @@ def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
 
 # --- Streamlit 介面 ---
 
-st.set_page_config(page_title="Miniko 投資戰情室 V9.7", layout="wide")
+st.set_page_config(page_title="Miniko 投資戰情室 V9.8", layout="wide")
 
-st.title("📊 Miniko & 曜鼎豐 - 投資戰情室 V9.7 (寬鬆容錯版)")
+st.title("📊 Miniko & 曜鼎豐 - 投資戰情室 V9.8 (機構法人完全版)")
 st.markdown("""
-**V9.7 更新：** 修正資料抓取過嚴導致「好股落榜」的問題。
-現在系統會自動處理資料缺失，優先確保主流股（如群聯、仁寶）能依據技術面與基礎估值入榜。
+本系統整合 **CAPM、Fama-French** 與 **大戶品質因子 (Quality)**。
+**V9.8 特點：** 結合 **ROIC 資本效率** 與 **FCF 真實估值**，並具備資料容錯機制，確保主流股與潛力股不遺漏。
 """)
+
+# --- 知識庫 Expander (恢復 V9.6 的詳細說明) ---
+with st.expander("📚 點此查看：機構法人選股邏輯 (ROIC & FCF)"):
+    tab_intent, tab_theory, tab_chips = st.tabs(["💎 核心：ROIC與品質", "CAPM與三因子", "籌碼與CGO"])
+    
+    with tab_intent:
+        st.markdown("""
+        ### 💎 大戶核心：ROIC 與 FCF 
+        
+        **1. ROIC (投入資本回報率)**：
+        * **定義**：公司用本錢 (股東權益+負債) 賺取本業獲利的效率。
+        * **門檻**：至少要 > WACC (約 5~8%)。若 > 15% 則為頂級護城河公司。
+        
+        **2. FCF Yield (自由現金流收益率)**：
+        * **定義**：`自由現金流 / 市值`。
+        * **意義**：這是您買下整間公司後，每年能拿到的真實現金回報。比本益比 (PE) 更真實，因為現金流騙不了人。
+        
+        **3. 價格意圖因子**：
+        * 輔助判斷：在基本面優異的前提下，尋找走勢穩定 (直線上漲) 的標的。
+        """)
+
+    with tab_theory:
+        st.markdown("""
+        ### CAPM & WACC
+        * **WACC**：資金成本概念。若預期報酬率 > WACC，才值得投資。
+        * **CAPM**：$E(R_i) = R_f + \\beta(R_m - R_f)$，計算合理的投資回報門檻。
+        """)
+        
+    with tab_chips:
+        st.markdown("""
+        ### CGO + Smart Beta
+        * **CGO (未實現獲利)**：正值代表大部分持股者賺錢，籌碼穩定惜售。
+        * **低波動**：長期回測顯示，低波動股票的夏普比率優於高波動熱門股。
+        """)
 
 # --- 主程式區 ---
 if 'results' not in st.session_state:
@@ -257,7 +298,7 @@ if 'results' not in st.session_state:
 col1, col2 = st.columns([1, 4])
 
 with col1:
-    st.info("💡 系統執行：混合評分機制 (技術面保底 + 財務面加分)")
+    st.info("💡 系統執行：大戶品質因子 (ROIC/FCF) + 技術面容錯掃描")
     if st.button("🚀 啟動 AI 智能運算", type="primary"):
         with st.spinner("Step 1: 載入大盤數據..."):
             market_returns = get_market_data()
@@ -265,7 +306,7 @@ with col1:
         with st.spinner("Step 2: 全市場掃描 (啟動容錯機制)..."):
             tickers, name_map = get_all_tw_tickers()
             
-        st.success(f"鎖定 {len(tickers)} 檔標的，開始分析...")
+        st.success(f"鎖定 {len(tickers)} 檔標的，開始深度分析...")
         st.session_state['results'] = []
         
         progress_bar = st.progress(0)
@@ -292,7 +333,7 @@ with col2:
     else:
         df = pd.DataFrame(st.session_state['results'])
         
-        # 排序：強制取出前 100 名，不管分數絕對值多少
+        # 排序：強制取出前 100 名
         df = df.sort_values(by=['AI綜合評分', '意圖因子'], ascending=[False, False]).head(100)
         
         st.subheader(f"🏆 AI 嚴選現貨清單 (Top 100)")
@@ -306,8 +347,8 @@ with col2:
                 "代號": st.column_config.TextColumn(width="small"),
                 "現價": st.column_config.NumberColumn(format="$%.2f"),
                 "AI綜合評分": st.column_config.ProgressColumn(format="%.1f", min_value=0, max_value=100),
-                "AI綜合建議": st.column_config.TextColumn(width="large"),
-                "ROIC": st.column_config.TextColumn(help="N/A代表資料暫缺，不影響入榜"),
+                "AI綜合建議": st.column_config.TextColumn(width="large", help="包含大戶視角的三面向診斷"),
+                "ROIC": st.column_config.TextColumn(help="投入資本回報率 (N/A表示暫缺)"),
                 "FCF Yield": st.column_config.TextColumn(),
                 "合理價": st.column_config.NumberColumn(format="$%.2f"),
                 "亮點": st.column_config.TextColumn(width="medium"),
