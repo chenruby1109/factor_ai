@@ -10,7 +10,7 @@ import twstock
 TELEGRAM_BOT_TOKEN = '您的_BOT_TOKEN' 
 TELEGRAM_CHAT_ID = '您的_CHAT_ID'
 
-# --- 全局參數 ---
+# --- 全局參數 (針對現貨交易調整) ---
 RF = 0.015  # 無風險利率
 MRP = 0.055 # 市場風險溢酬
 G_GROWTH = 0.02 # 股利長期成長率
@@ -41,7 +41,7 @@ def get_all_tw_tickers():
     tickers = []
     name_map = {}
     try:
-        # 示範抓取 twstock 內建清單 (建議分批或使用完整清單)
+        # 抓取 twstock 內建清單
         for code, info in twstock.codes.items():
             if info.type == '股票':
                 suffix = ".TW" if info.market == '上市' else ".TWO"
@@ -53,7 +53,7 @@ def get_all_tw_tickers():
         return [], {}
 
 def get_realtime_price_robust(stock_code):
-    """【V8.3 價格修復版】"""
+    """【V8.3 價格修復版】(History + Realtime 雙重驗證)"""
     price = None
     try:
         ticker = yf.Ticker(stock_code)
@@ -77,120 +77,114 @@ def get_realtime_price_robust(stock_code):
         except: pass
     return price
 
-def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
+def calculate_ai_factors(ticker_symbol, name_map, market_returns):
     """
-    【Miniko V9.1 現貨實戰版核心】
+    【Miniko V9.1 AI 綜合評估核心】
+    針對「現貨買入」優化：移除融資建議，加入買點計算與 AI 評分
     """
     try:
         current_price = get_realtime_price_robust(ticker_symbol)
         if current_price is None or current_price <= 0: return None
 
-        # 抓取 1 年數據
+        # 抓取數據 (拉長至 1 年以計算年線與波動)
         data = yf.download(ticker_symbol, period="1y", interval="1d", progress=False)
         if len(data) < 100: return None 
         if isinstance(data.columns, pd.MultiIndex):
             data.columns = data.columns.get_level_values(0)
         
-        if current_price < 10: return None 
+        if current_price < 10: return None # 排除雞蛋水餃股
 
-        # --- 1. CAPM (計算資金成本供評價用，不給舉債建議) ---
+        # 基礎計算
         stock_returns = data['Close'].pct_change().dropna()
-        aligned = pd.concat([stock_returns, market_returns], axis=1, join='inner').dropna()
-        aligned.columns = ['Stock', 'Market']
-        
-        if len(aligned) < 60: return None
-
-        cov = aligned.cov().iloc[0, 1]
-        mkt_var = aligned['Market'].var()
-        beta = cov / mkt_var if mkt_var != 0 else 1.0
-        ke = RF + beta * MRP # 投資人要求報酬率
-
-        # --- 2. Gordon Model (合理價) ---
         ticker_info = yf.Ticker(ticker_symbol).info
+        
+        # --- 1. 技術指標與買點計算 ---
+        ma20 = data['Close'].rolling(20).mean().iloc[-1]  # 月線 (支撐/買點)
+        ma60 = data['Close'].rolling(60).mean().iloc[-1]  # 季線 (趨勢)
+        ma100 = data['Close'].rolling(100).mean().iloc[-1] # 用於 CGO 成本
+        
+        # 建議買點邏輯：
+        # 如果是強勢股(在月線之上)，建議掛在月線(MA20)附近接，不要追高。
+        # 如果股價已經修正到月線下，則建議以現價觀察。
+        suggested_buy_price = ma20 if current_price > ma20 else current_price
+
+        # --- 2. CGO 與 波動率 ---
+        cgo_val = (current_price - ma100) / ma100
+        volatility = stock_returns.std() * (252**0.5)
+
+        # --- 3. Gordon 合理價 ---
         div_rate = ticker_info.get('dividendRate', 0)
         if not div_rate:
             yield_val = ticker_info.get('dividendYield', 0)
             if yield_val: div_rate = current_price * yield_val
 
         fair_value = np.nan
-        k_minus_g = max(ke - G_GROWTH, 0.015) 
-        if div_rate and div_rate > 0:
-            fair_value = round(div_rate / k_minus_g, 2)
+        # 計算 Ke (資金成本) 僅用於折現，不給融資建議
+        aligned = pd.concat([stock_returns, market_returns], axis=1, join='inner').dropna()
+        aligned.columns = ['Stock', 'Market']
+        if len(aligned) > 60:
+            cov = aligned.cov().iloc[0, 1]
+            mkt_var = aligned['Market'].var()
+            beta = cov / mkt_var if mkt_var != 0 else 1.0
+            ke = RF + beta * MRP
+            k_minus_g = max(ke - G_GROWTH, 0.015) 
+            if div_rate and div_rate > 0:
+                fair_value = round(div_rate / k_minus_g, 2)
 
-        # --- 3. Fama-French 因子邏輯 ---
-        market_cap = ticker_info.get('marketCap', 0)
-        is_small_cap = market_cap > 0 and market_cap < 50000000000
-        pb = ticker_info.get('priceToBook', 0)
-        is_value_stock = pb > 0 and pb < 1.5
-        
-        # --- 4. Smart Beta & 技術買點 ---
-        ma100 = data['Close'].rolling(100).mean().iloc[-1]
-        ma20 = data['Close'].rolling(20).mean().iloc[-1] # 月線
-        
-        cgo_val = (current_price - ma100) / ma100
-        volatility = stock_returns.std() * (252**0.5)
-        
-        # 建議買點：設定為月線 (MA20)，這是現貨波段操作常見的支撐點
-        entry_price = round(ma20, 2)
+        # --- 4. AI 綜合評估 (0-100分) ---
+        # 這是專為「現貨波段」設計的權重
+        ai_score = 0
+        highlights = []
 
-        strategy_tags = []
-        if cgo_val > 0.1 and volatility < 0.3:
-            strategy_tags.append("🔥CGO低波") 
-        
-        # --- 5. AI 綜合評分系統 ---
-        score = 0.0
-        factors = []
-        
-        if is_value_stock:
-            score += 15
-            factors.append("💎價值型")
-        if not np.isnan(fair_value) and fair_value > current_price:
-            score += 20
-            factors.append("💰低估")
-            
-        if is_small_cap:
-            score += 10
-            
-        rev_growth = ticker_info.get('revenueGrowth', 0)
-        if rev_growth > 0.2:
-            score += 15
-            factors.append("📈高成長")
-            
-        if current_price > ma20:
-            score += 10 
+        # A. 趨勢面 (Trend) - 佔 30分
+        if current_price > ma20 and ma20 > ma60:
+            ai_score += 20
+            highlights.append("📈多頭排列")
+        if current_price > ma60:
+            ai_score += 10
 
+        # B. 籌碼/情緒面 (CGO + Vol) - 佔 30分
+        if cgo_val > 0.05: # 大部分人賺錢，惜售
+            ai_score += 15
+            highlights.append("🔥籌碼鎖定(CGO高)")
+        if volatility < 0.35: # 波動穩定
+            ai_score += 15
+            highlights.append("🛡️波動穩定")
+
+        # C. 基本面 (Value/Growth) - 佔 25分
         roe = ticker_info.get('returnOnEquity', 0)
         if roe > 0.15:
-            score += 15
-            factors.append("👑高ROE")
-            
-        if volatility < 0.25:
-            score += 15
-            factors.append("🛡️籌碼穩")
-        elif volatility > 0.5:
-            score -= 10
-            
-        # AI 推薦語
-        ai_eval = "🟡 觀察"
-        if score >= 75:
-            ai_eval = "🚀 強力買進"
-        elif score >= 60:
-            ai_eval = "🟢 積極佈局"
-        elif score >= 50:
-            ai_eval = "🔵 持有/觀望"
+            ai_score += 15
+            highlights.append("👑高ROE")
+        
+        rev_growth = ticker_info.get('revenueGrowth', 0)
+        if rev_growth > 0.2:
+            ai_score += 10
+            highlights.append("🚀營收高成長")
 
-        if score >= 50:
+        # D. 估值面 (Valuation) - 佔 15分
+        pb = ticker_info.get('priceToBook', 0)
+        if pb > 0 and pb < 2.0:
+            ai_score += 15
+            highlights.append("💎股價低估")
+
+        # 額外加分：安全邊際
+        if not np.isnan(fair_value) and fair_value > current_price * 1.1:
+            ai_score += 5
+            highlights.append("💰低於合理價")
+
+        # 篩選門檻：分數太低的不顯示
+        if ai_score >= 60:
             return {
-                "代號": ticker_symbol.replace('.TW', '').replace('.TWO', ''),
+                "代號": ticker_symbol.replace(".TW", "").replace(".TWO", ""), # 簡化代號顯示
                 "名稱": name_map.get(ticker_symbol, ticker_symbol),
-                "AI建議": ai_eval,
                 "現價": float(current_price),
-                "建議買點": float(entry_price),
-                "評分": round(score, 1),
+                "AI綜合評分": ai_score,
+                "建議買點": round(suggested_buy_price, 2), # 新增建議買點
                 "合理價": fair_value if not np.isnan(fair_value) else None,
                 "CGO指標": round(cgo_val * 100, 1),
-                "策略標籤": " ".join(strategy_tags),
-                "亮點": " | ".join(factors)
+                "波動率": round(volatility, 2),
+                "亮點": " | ".join(highlights)
             }
     except:
         return None
@@ -198,72 +192,83 @@ def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
 
 # --- Streamlit 介面 ---
 
-st.set_page_config(page_title="Miniko 投資戰情室 V9.1", layout="wide")
+st.set_page_config(page_title="Miniko 曜鼎豐 - AI 智能選股 V9.1", layout="wide")
 
-st.title("📊 Miniko & 曜鼎豐 - 投資戰情室 V9.1 (現貨實戰版)")
+st.title("🦄 Miniko & 曜鼎豐 - AI 智能選股戰情室 V9.1")
 st.markdown("""
-本系統專注於 **現貨買入策略**，結合 AI 綜合評分與技術面支撐，篩選全市場最優質的標的。
+**專屬設定：** 現貨交易模式 (No Leverage) | AI 綜合評分 Top 100 | 智能買點計算
 """)
-
-if 'results' not in st.session_state:
-    st.session_state['results'] = []
 
 col1, col2 = st.columns([1, 4])
 
 with col1:
-    st.info("💡 系統將篩選「Top 100」推薦個股，並計算建議買入點位。")
-    if st.button("🚀 啟動 V9.1 智能掃描", type="primary"):
-        with st.spinner("Step 1: 取得市場數據..."):
+    st.info("💡 按下按鈕後，AI 將掃描全台股，並依照綜合分數選出前 100 檔最強現貨標的。")
+    
+    if st.button("🚀 啟動 AI 全面掃描", type="primary"):
+        with st.spinner("Step 1: 讀取市場數據與參數..."):
             market_returns = get_market_data()
         
         with st.spinner("Step 2: 載入股票清單..."):
             tickers, name_map = get_all_tw_tickers()
             
-        st.success(f"開始分析 {len(tickers)} 檔股票...")
+        st.success(f"鎖定目標：{len(tickers)} 檔股票，開始 AI 運算...")
         st.session_state['results'] = []
         
         progress_bar = st.progress(0)
         status_text = st.empty()
         
+        # 平行運算加速
         with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-            future_to_ticker = {executor.submit(calculate_theoretical_factors, t, name_map, market_returns): t for t in tickers}
+            future_to_ticker = {executor.submit(calculate_ai_factors, t, name_map, market_returns): t for t in tickers}
             
             completed = 0
             for future in concurrent.futures.as_completed(future_to_ticker):
                 data = future.result()
                 completed += 1
-                if completed % 10 == 0:
+                if completed % 20 == 0: # 減少更新頻率以提升效能
                     progress_bar.progress(completed / len(tickers))
-                    status_text.text(f"分析中: {completed}/{len(tickers)}")
+                    status_text.text(f"AI 分析中: {completed}/{len(tickers)}")
                 if data:
                     st.session_state['results'].append(data)
 
-        status_text.text("✅ 分析完成！")
+        status_text.text("✅ AI 運算完成！")
 
 with col2:
-    if not st.session_state['results']:
-        st.write("👈 點擊按鈕開始分析。")
+    if 'results' not in st.session_state or not st.session_state['results']:
+        st.warning("👈 請點擊左側按鈕開始分析。")
+        st.markdown("### 📊 AI 評分邏輯說明")
+        st.markdown("""
+        * **趨勢 (30%)**：股價是否站在月線/季線之上 (多頭排列)。
+        * **籌碼 (30%)**：CGO 指標 (惜售程度) 與 低波動率 (籌碼穩定)。
+        * **基本 (25%)**：高 ROE 與 營收成長率。
+        * **估值 (15%)**：低股價淨值比 (PB) 與 合理價位。
+        """)
     else:
         df = pd.DataFrame(st.session_state['results'])
         
-        # 排序與篩選：先按評分高低排序，取前 100 名
-        df = df.sort_values(by=['評分'], ascending=False).head(100)
+        # --- 關鍵邏輯：只取 AI 評分最高的前 100 檔 ---
+        df = df.sort_values(by=['AI綜合評分', 'CGO指標'], ascending=[False, False])
+        df_top100 = df.head(100) # 取前 100
         
-        st.subheader(f"🏆 AI 嚴選：最推薦優先買入 Top 100")
+        st.subheader(f"🏆 AI 精選推薦：前 100 檔優質現貨 ({len(df_top100)}/{len(df)})")
         
         st.dataframe(
-            df,
+            df_top100,
             use_container_width=True,
             hide_index=True,
-            column_order=["代號", "名稱", "AI建議", "現價", "建議買點", "合理價", "評分", "策略標籤", "CGO指標", "亮點"],
+            column_order=["代號", "名稱", "AI綜合評分", "現價", "建議買點", "合理價", "CGO指標", "亮點"],
             column_config={
-                "代號": st.column_config.TextColumn(width="small"),
-                "AI建議": st.column_config.TextColumn(width="small", help="AI 根據財務與技術面綜合判斷"),
+                "代號": st.column_config.TextColumn(help="股票代號"),
                 "現價": st.column_config.NumberColumn(format="$%.2f"),
-                "建議買點": st.column_config.NumberColumn(format="$%.2f", help="技術面支撐點位 (月線 MA20)，適合現貨佈局"),
-                "合理價": st.column_config.NumberColumn(format="$%.2f", help="Gordon Model 理論價值"),
-                "評分": st.column_config.ProgressColumn(format="%.1f", min_value=0, max_value=100),
-                "CGO指標": st.column_config.NumberColumn(format="%.1f%%", help="未實現獲利指標，越高代表籌碼越安定"),
+                "建議買點": st.column_config.NumberColumn(format="$%.2f", help="依據月線(20MA)計算之支撐價位，若現價過高建議等待回調"),
+                "AI綜合評分": st.column_config.ProgressColumn(
+                    format="%d 分", 
+                    min_value=0, 
+                    max_value=100,
+                    help="Miniko AI 綜合多因子評分，越高越好"
+                ),
+                "合理價": st.column_config.NumberColumn(format="$%.2f", help="Gordon Model 估算"),
+                "CGO指標": st.column_config.NumberColumn(format="%.1f%%", help="正值越大代表籌碼越穩"),
                 "亮點": st.column_config.TextColumn(width="medium"),
             }
         )
