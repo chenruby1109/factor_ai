@@ -81,9 +81,9 @@ def get_realtime_price_robust(stock_code):
 
 def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
     """
-    【Miniko V9.2 旗艦運算核心 - 現貨版】
+    【Miniko V9.2 旗艦運算核心 - 實戰買點優化版】
     整合 CAPM, Fama-French, CGO, Smart Beta
-    新增：AI 綜合評分排序、(優化版)貼近盤面的建議買點
+    新增：動態位階買點 (Dynamic Entry Point) - 確保買點與現價不會脫節
     """
     try:
         current_price = get_realtime_price_robust(ticker_symbol)
@@ -149,6 +149,12 @@ def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
         # --- 5. AI 綜合評分系統 (V9.2 升級版) ---
         score = 0.0
         factors = []
+
+        # 準備多週期均線 (用於評分與買點計算)
+        ma5 = data['Close'].rolling(5).mean().iloc[-1]
+        ma10 = data['Close'].rolling(10).mean().iloc[-1]
+        ma20 = data['Close'].rolling(20).mean().iloc[-1]
+        ma60 = data['Close'].rolling(60).mean().iloc[-1]
         
         # 價值因子 (Value)
         if is_value_stock:
@@ -170,10 +176,6 @@ def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
             factors.append("📈高成長")
             
         # 技術面動能
-        ma5 = data['Close'].rolling(5).mean().iloc[-1]
-        ma10 = data['Close'].rolling(10).mean().iloc[-1]
-        ma20 = data['Close'].rolling(20).mean().iloc[-1]
-
         if current_price > ma20:
             score += 10 # 短期多頭排列
         else:
@@ -192,51 +194,57 @@ def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
         elif volatility > 0.5:
             score -= 10
             
-        # --- 6. 建議買入點位計算 (V9.2 優化版：貼近盤面) ---
-        # 邏輯說明：
-        # 1. 強勢股 (現價 > 月線)：買點不能太低，否則買不到。改掛在 5日線或10日線附近。
-        # 2. 弱勢股/回檔股 (現價 < 月線)：保守掛在月線下方 2% 或近期低點。
-        # 3. 防呆：買點必須 < 現價。若計算出買點 > 現價，強制設定為現價的 98%。
-
-        buy_suggestion = 0.0
-        buy_note = ""
-
+        # --- 6. 建議買入點位計算 (V9.2 實戰掛單邏輯) ---
+        # 邏輯核心：不做太遠的夢，根據「乖離率」判斷是該追 MA10 還是等 MA60
+        
+        bias_ma20 = (current_price - ma20) / ma20 # 與月線的乖離率
+        
+        # 預設值
+        buy_suggestion = ma20 
+        buy_note = "月線支撐"
+        
+        # 狀況 A: 多頭強勢股 (股價 > 月線)
         if current_price > ma20:
-            # 強勢股：回檔 5日或10日線即買點 ( aggressive buy )
-            if current_price > ma5:
-                buy_suggestion = ma5
-                buy_note = "強勢回測MA5"
-            else:
+            if bias_ma20 > 0.1: 
+                # 乖離 > 10% (噴出段)：等月線會買不到，改掛 MA10 或 MA5
                 buy_suggestion = ma10
-                buy_note = "回測MA10支撐"
-        else:
-            # 弱勢/整理股：掛月線下方或合理價 ( conservative buy )
-            target = ma20 * 0.98 # 月線下 2%
-            if not np.isnan(fair_value) and fair_value < target:
-                buy_suggestion = fair_value
-                buy_note = "價值投資買點"
+                buy_note = "強勢回檔(MA10)"
+            elif bias_ma20 > 0.04:
+                # 乖離 4%~10% (正常趨勢)：掛月線即可
+                buy_suggestion = ma20
+                buy_note = "趨勢支撐(MA20)"
             else:
-                buy_suggestion = target
-                buy_note = "月線乖離買點"
+                # 乖離 < 4% (就在月線邊)：直接掛現價下方一點點，確保成交
+                buy_suggestion = current_price * 0.985
+                buy_note = "貼近月線(現價佈局)"
         
-        # 
+        # 狀況 B: 整理/回檔股 (股價 < 月線)
+        else:
+            if current_price > ma60:
+                # 雖然破月線，但還在季線之上 (中期多頭)
+                buy_suggestion = ma60
+                buy_note = "季線防守(MA60)"
+            else:
+                # 連季線都破了 (弱勢/超跌) -> 避免接刀，只抓短線反彈
+                # 設定一個「技術性反彈點」，例如現價打 95 折
+                buy_suggestion = current_price * 0.95 
+                buy_note = "超跌緩衝(-5%)"
+                
+                # 如果合理價(Fair Value)就在現價附近(且不低得太離譜)，則以合理價為準
+                if not np.isnan(fair_value):
+                    # 邏輯：合理價低於現價，但高於現價的85% (太低就沒意義了)
+                    if (current_price * 0.85) < fair_value < current_price:
+                        buy_suggestion = fair_value
+                        buy_note = "價值浮現(合理價)"
 
-[Image of Bollinger Bands strategy]
- 
-        # 最終防呆：若建議買點 >= 現價 (例如剛跌破均線)，強制設為現價向下 1.5%~2%
-        # 確保使用者是「掛單等待」而非「市價追高」
-        if buy_suggestion >= current_price:
-            buy_suggestion = current_price * 0.985
-            buy_note = "現價回檔佈局"
-        
         # 篩選門檻
         if score >= 50:
             return {
                 "代號": ticker_symbol.replace(".TW", "").replace(".TWO", ""), # 簡化代號顯示
                 "名稱": name_map.get(ticker_symbol, ticker_symbol),
                 "現價": float(current_price),
-                "AI綜合評分": round(score, 1), 
-                "建議買點": float(buy_suggestion),
+                "AI綜合評分": round(score, 1), # 改名為 AI 綜合評分
+                "建議買點": float(round(buy_suggestion, 2)), # 取小數點兩位
                 "買點說明": buy_note,
                 "合理價": fair_value if not np.isnan(fair_value) else None,
                 "波動率": volatility,
@@ -252,10 +260,10 @@ def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
 
 st.set_page_config(page_title="Miniko 投資戰情室 V9.2", layout="wide")
 
-st.title("📊 Miniko & 曜鼎豐 - 投資戰情室 V9.2 (現貨AI精選版)")
+st.title("📊 Miniko & 曜鼎豐 - 投資戰情室 V9.2 (實戰買點優化版)")
 st.markdown("""
 本系統整合 **CAPM、Fama-French 三因子、Gordon 模型** 與 **Smart Beta (CGO+低波動)** 策略。
-**【V9.2 更新】** 專注現貨交易 (無融資)，AI 自動演算推薦前 100 檔優質標的，並提供**貼近盤面的建議買點**。
+**【V9.2 更新】** 強化「建議買點」邏輯，依據乖離率與均線動態調整，確保買點具備實戰成交可能性。
 """)
 
 # --- 知識庫 Expander (更新內容) ---
@@ -317,7 +325,7 @@ with st.expander("📚 點此查看：投資理論與籌碼面分析教學 (Mini
         * **💰 投資決策 (WACC)**：計算加權資金成本，將未來現金流折現算出現值 (NPV)。
         * **🏦 融資決策**：
             * 若 銀行借款利率 (4%) < 預期報酬率 (6%) ➜ **傾向舉債** (成本較低)。
-            * *註：本系統 V9.2 採現貨策略，不建議個人過度槓桿。*
+            * *註：本系統 V9.1 採現貨策略，不建議個人過度槓桿。*
 
         #### 3. Gordon Model (股價評價)
         * **公式**：$P = Div / (K - g)$
@@ -439,7 +447,7 @@ with col2:
                 "代號": st.column_config.TextColumn(help="股票代碼"),
                 "現價": st.column_config.NumberColumn(format="$%.2f"),
                 "AI綜合評分": st.column_config.ProgressColumn(format="%.1f", min_value=0, max_value=100, help="綜合基本面與技術面的AI評分"),
-                "建議買點": st.column_config.NumberColumn(format="$%.2f", help="結合技術面與安全邊際的建議掛單點"),
+                "建議買點": st.column_config.NumberColumn(format="$%.2f", help="根據位階(MA5/10/20/60)計算的實戰掛單點"),
                 "合理價": st.column_config.NumberColumn(format="$%.2f", help="Gordon Model 計算之合理股價"),
                 "CGO指標": st.column_config.NumberColumn(format="%.1f%%", help="正值代表多數人獲利(支撐強)"),
                 "波動率": st.column_config.NumberColumn(format="%.2f", help="越低代表籌碼越穩定"),
