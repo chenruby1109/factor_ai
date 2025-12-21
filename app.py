@@ -128,3 +128,144 @@ def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
         factors = []
         
         # 價值面
+        pb = ticker_info.get('priceToBook', 0)
+        if pb > 0 and pb < 1.5:
+            score += 15
+            factors.append("💎低PB")
+        if not np.isnan(fair_value) and fair_value > current_price * 1.1:
+            score += 20
+            factors.append("💰低估")
+            
+        # 成長與規模
+        mkt_cap = ticker_info.get('marketCap', 0)
+        if 0 < mkt_cap < 50000000000:
+            score += 10
+            factors.append("🐟中小型")
+            
+        # 技術面
+        if current_price > ma20 and ma20 > ma60:
+            score += 15
+            factors.append("🐂多頭排列")
+            
+        # 籌碼面
+        if cgo_val > 0.1:
+            score += 15
+            factors.append("🔥籌碼優") # CGO高
+            
+        # 穩定度
+        if volatility < 0.3:
+            score += 15
+            factors.append("🛡️穩健")
+        
+        # 門檻：50分以上才回傳，減少列表長度
+        if score >= 50:
+            return {
+                "代號": ticker_symbol,
+                "名稱": name_map.get(ticker_symbol, ticker_symbol),
+                "現價": float(current_price),
+                "AI評分": score,
+                "買入點": buy_point,
+                "合理價": fair_value if not np.isnan(fair_value) else None,
+                "CGO指標": round(cgo_val * 100, 1),
+                "亮點": " | ".join(factors)
+            }
+    except:
+        return None
+    return None
+
+# --- Streamlit 介面 ---
+
+st.set_page_config(page_title="Miniko 投資戰情室 V10.0 (Full)", layout="wide")
+
+st.title("📊 Miniko & 曜鼎豐 - 投資戰情室 V10.0 (全台股深度掃描版)")
+st.caption("專為 Streamlit Cloud 優化的全市場掃描，包含 AI 評分、買點建議與 CGO 策略。")
+
+# --- 側邊欄 ---
+with st.sidebar:
+    st.header("⚙️ 掃描設定")
+    run_btn = st.button("🚀 啟動全市場掃描 (約需15分鐘)", type="primary")
+    st.info("⚠️ 為了防止雲端當機，系統將採用「分批處理」模式。請耐心等待，勿關閉視窗。")
+
+# --- 主程式 ---
+if run_btn:
+    st.session_state['results'] = []
+    
+    with st.spinner("Step 1: 下載大盤與股票清單..."):
+        market_returns = get_market_data()
+        tickers, name_map = get_all_tw_tickers()
+        
+    st.success(f"取得 {len(tickers)} 檔股票，開始 AI 運算...")
+    
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    result_container = st.container() # 用來最後顯示結果
+    
+    # --- 關鍵修改：更安全的 Batch 處理 ---
+    # 將 batch size 設為 30，確保記憶體絕對安全
+    BATCH_SIZE = 30 
+    total_processed = 0
+    all_results = []
+    
+    # 外層迴圈：控制批次
+    for i in range(0, len(tickers), BATCH_SIZE):
+        batch_tickers = tickers[i : i + BATCH_SIZE]
+        
+        # 內層：每次只開一個小的 ThreadPool，跑完就關閉釋放資源
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            futures = {
+                executor.submit(calculate_theoretical_factors, t, name_map, market_returns): t 
+                for t in batch_tickers
+            }
+            
+            for future in concurrent.futures.as_completed(futures):
+                res = future.result()
+                if res:
+                    all_results.append(res)
+                total_processed += 1
+        
+        # 更新進度
+        progress = min(total_processed / len(tickers), 1.0)
+        progress_bar.progress(progress)
+        status_text.text(f"正在掃描: {total_processed} / {len(tickers)} (已找到 {len(all_results)} 檔潛力股)...")
+        
+        # ★★★ 關鍵：強制清理記憶體 ★★★
+        gc.collect() 
+        # 稍微休息一下，避免 CPU 過熱被雲端踢掉
+        time.sleep(0.05) 
+
+    st.session_state['results'] = all_results
+    status_text.text("✅ 全市場掃描完成！")
+
+# --- 顯示結果 ---
+if 'results' in st.session_state and st.session_state['results']:
+    df = pd.DataFrame(st.session_state['results'])
+    
+    if not df.empty:
+        # 排序邏輯：AI 評分高 -> CGO 高 -> 價格低
+        df = df.sort_values(by=['AI評分', 'CGO指標'], ascending=[False, False])
+        
+        # 只取 Top 100
+        top_100 = df.head(100)
+        
+        st.divider()
+        st.subheader(f"🏆 AI 嚴選 Top 100 (現貨買入推薦)")
+        st.markdown(f"從 **{len(df)}** 檔及格股票中，篩選出分數最高的 100 檔。")
+        
+        st.dataframe(
+            top_100,
+            use_container_width=True,
+            hide_index=True,
+            column_order=["代號", "名稱", "現價", "AI評分", "買入點", "合理價", "CGO指標", "亮點"],
+            column_config={
+                "現價": st.column_config.NumberColumn(format="$%.2f"),
+                "買入點": st.column_config.NumberColumn(format="$%.2f", help="技術面支撐位(月線)"),
+                "合理價": st.column_config.NumberColumn(format="$%.2f", help="Gordon 模型估值"),
+                "AI評分": st.column_config.ProgressColumn(format="%d", min_value=0, max_value=100),
+                "CGO指標": st.column_config.NumberColumn(format="%.1f%%"),
+                "亮點": st.column_config.TextColumn(width="medium"),
+            }
+        )
+    else:
+        st.warning("沒有找到符合條件的股票。")
+else:
+    st.info("👈 請點擊左側按鈕開始掃描 (因為資料量大，可能需要 10-15 分鐘)。")
