@@ -76,7 +76,7 @@ def get_realtime_price_robust(stock_code):
 
 def get_financial_metrics_deep(ticker_obj):
     """
-    【V9.9 深層挖掘引擎】
+    【V9.9 大戶法人旗艦版】
     如果不依賴 unstable 的 .info，直接從三大報表 (financials, balance_sheet, cashflow) 
     挖掘原始數據並手動計算 ROIC 和 FCF。
     """
@@ -311,7 +311,7 @@ def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
 
 st.set_page_config(page_title="Miniko 投資戰情室 V9.9", layout="wide")
 
-st.title("📊 Miniko & 曜鼎豐 - 投資戰情室 V9.9 (深層挖掘版)")
+st.title("📊 Miniko  - 大戶悄悄話茶室 V9.9 (大戶法人旗艦版)")
 st.markdown("""
 本系統整合 **CAPM、Fama-French** 與 **大戶品質因子 (Quality)**。
 **V9.9 最終修復：** 啟用「深層挖掘 (Deep Mining)」技術，直接讀取財報原始數據並手動運算，解決資料庫缺漏問題，讓 ROIC 與 FCF 數據重見天日。
