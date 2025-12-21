@@ -396,12 +396,21 @@ col1, col2 = st.columns([1, 4])
 
 with col1:
     st.info("💡 系統將執行 AI 綜合評估，整合 Gordon Model 合理價與 HiStock 產業資訊。")
-    if st.button("🚀 啟動 AI 智能掃描 (Top 100)", type="primary"):
+    
+    # --- 新增：讓使用者選擇掃描範圍，避免一次跑太當機 ---
+    scan_limit = st.slider("選擇掃描股票數量 (建議雲端版設為 100 以內)", 10, 200, 50)
+    
+    if st.button("🚀 啟動 AI 智能掃描", type="primary"):
         with st.spinner("Step 1: 計算市場風險參數 (Beta/MRP)..."):
             market_returns = get_market_data()
         
         with st.spinner("Step 2: 載入股票清單 & 連線 HiStock..."):
             tickers, name_map = get_all_tw_tickers()
+            
+            # 【關鍵修正 1】限制掃描數量，避免記憶體爆掉
+            if len(tickers) > scan_limit:
+                st.warning(f"⚠️ 雲端資源有限，僅掃描前 {scan_limit} 檔股票作為示範。")
+                tickers = tickers[:scan_limit] 
             
         st.success(f"開始分析 {len(tickers)} 檔股票的財務因子...")
         st.session_state['results'] = []
@@ -409,21 +418,32 @@ with col1:
         progress_bar = st.progress(0)
         status_text = st.empty()
         
-        # 平行運算
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-            future_to_ticker = {executor.submit(calculate_theoretical_factors, t, name_map, market_returns): t for t in tickers}
+        # 【關鍵修正 2】降低 max_workers 為 4 (原為 10)，避免 Thread Error
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+                future_to_ticker = {executor.submit(calculate_theoretical_factors, t, name_map, market_returns): t for t in tickers}
+                
+                completed = 0
+                for future in concurrent.futures.as_completed(future_to_ticker):
+                    try:
+                        data = future.result()
+                        if data:
+                            st.session_state['results'].append(data)
+                    except Exception as e:
+                        pass # 忽略單一股票的錯誤，讓程式繼續跑
+                    
+                    completed += 1
+                    # 更新進度條
+                    if completed % 5 == 0:  # 減少更新頻率以提升效能
+                        progress_bar.progress(completed / len(tickers))
+                        status_text.text(f"AI 分析中: {completed}/{len(tickers)}")
+                        
+            status_text.text("✅ AI 分析完成！")
             
-            completed = 0
-            for future in concurrent.futures.as_completed(future_to_ticker):
-                data = future.result()
-                completed += 1
-                if completed % 10 == 0:
-                    progress_bar.progress(completed / len(tickers))
-                    status_text.text(f"AI 分析中: {completed}/{len(tickers)}")
-                if data:
-                    st.session_state['results'].append(data)
-
-        status_text.text("✅ AI 分析完成！")
+        except RuntimeError:
+            st.error("系統資源不足，請嘗試減少掃描數量或重新整理頁面。")
+        except Exception as e:
+            st.error(f"發生未預期的錯誤: {e}")
 
 with col2:
     if not st.session_state['results']:
