@@ -12,6 +12,11 @@ import twstock
 TELEGRAM_BOT_TOKEN = '您的_BOT_TOKEN' 
 TELEGRAM_CHAT_ID = '您的_CHAT_ID'
 
+# --- 全局參數 (依據您的筆記設定) ---
+RF = 0.015  # 無風險利率 (假設 1.5% 定存)
+MRP = 0.05  # 市場風險溢酬 (Rm - Rf, 假設 5%)
+G_GROWTH = 0.02 # 股利長期成長率假設 (保守估計 2%)
+
 # --- 核心功能 ---
 
 def send_telegram_message(message):
@@ -22,171 +27,173 @@ def send_telegram_message(message):
     except: pass
 
 @st.cache_data(ttl=3600) 
+def get_market_data():
+    """下載大盤指數 (TWII) 用於計算 Beta (CAPM)"""
+    try:
+        # 抓取 1 年數據以計算 Beta
+        market = yf.download("^TWII", period="1y", interval="1d", progress=False)
+        if isinstance(market.columns, pd.MultiIndex):
+            market.columns = market.columns.get_level_values(0)
+        # 計算日報酬率
+        market['Return'] = market['Close'].pct_change()
+        return market['Return'].dropna()
+    except:
+        return pd.Series()
+
+@st.cache_data(ttl=3600) 
 def get_all_tw_tickers():
-    """
-    使用 twstock 直接調用內建字典，獲取全台 1800+ 檔股票代號
-    優點：速度快、不需要連線證交所、絕對不會有 SSL 錯誤
-    """
+    """使用 twstock 直接調用內建字典"""
     tickers = []
     name_map = {}
-    
     try:
-        # 遍歷 twstock 資料庫
         for code, info in twstock.codes.items():
-            # 過濾條件：只抓「股票」，排除權證(W)、ETF(00)、特別股等
             if info.type == '股票':
-                suffix = ""
-                if info.market == '上市':
-                    suffix = ".TW"
-                elif info.market == '上櫃':
-                    suffix = ".TWO"
-                
-                if suffix:
-                    full_ticker = code + suffix
-                    tickers.append(full_ticker)
-                    name_map[full_ticker] = info.name
-                    
+                suffix = ".TW" if info.market == '上市' else ".TWO"
+                full_ticker = code + suffix
+                tickers.append(full_ticker)
+                name_map[full_ticker] = info.name
         return tickers, name_map
     except Exception as e:
-        st.error(f"字典讀取失敗: {e}")
         return [], {}
 
-def calculate_fgm_score(ticker_symbol, name_map):
+def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
     """
-    【Miniko F-G-M 大戶模型】
-    F (Fundamentals): ROE, PEG (價值與品質)
-    G (Growth): 營收成長 (動能來源)
-    M (Momentum): 剛站上季線, MACD翻紅, 量能異常 (狙擊進場點)
+    【Miniko V7 華爾街理論版】
+    整合 CAPM, Gordon Model, Fama-French 三因子
     """
     try:
-        # 1. 下載數據 (抓取半年數據以計算季線)
-        data = yf.download(ticker_symbol, period="6mo", interval="1d", progress=False)
+        # 1. 下載個股數據 (1年)
+        data = yf.download(ticker_symbol, period="1y", interval="1d", progress=False)
         
-        # 資料防呆
-        if len(data) < 60: return None
+        if len(data) < 200: return None # 資料不足一年不計算
         if isinstance(data.columns, pd.MultiIndex):
             data.columns = data.columns.get_level_values(0)
 
+        # 準備基本數據
         curr = data.iloc[-1]
-        prev = data.iloc[-2]
         close = curr['Close']
         volume = curr['Volume']
+        
+        # 過濾殭屍股
+        if volume < 200000 or close < 10: return None
 
-        # --- 0. 初步過濾 (Filter) ---
-        # 排除流動性太差的股票 (成交量 < 300張 或 股價 < 10元)
-        if volume < 300000 or close < 10: return None
+        # --- A. CAPM 模型計算 (資本資產定價) ---
+        # 1. 計算個股日報酬
+        stock_returns = data['Close'].pct_change().dropna()
+        
+        # 2. 合併數據計算 Beta (共變異數 / 市場變異數)
+        # 需確保日期對齊
+        aligned_data = pd.concat([stock_returns, market_returns], axis=1).dropna()
+        aligned_data.columns = ['Stock', 'Market']
+        
+        covariance = aligned_data.cov().iloc[0, 1]
+        market_variance = aligned_data['Market'].var()
+        beta = covariance / market_variance # 系統性風險係數
+        
+        # 3. 計算預期報酬率 E(Ri) = Rf + Beta * MRP
+        expected_return = RF + beta * MRP #這就是投資人要求的權益資金成本
 
-        # --- 1. 計算基本面與成長因子 (Fundamentals & Growth) ---
-        # 由於 yfinance 台股財報常缺漏，我們用「估算」方式
+        # --- B. Gordon 評價模型 (合理股價) ---
         ticker_info = yf.Ticker(ticker_symbol).info
+        dividend_yield = ticker_info.get('dividendYield', 0)
+        dividend_rate = ticker_info.get('dividendRate', 0)
         
-        # G: 營收成長 (Revenue Growth)
-        rev_growth = ticker_info.get('revenueGrowth', 0) # 0.25 = 25%
+        fair_value = "N/A"
+        undervalued_pct = 0
         
-        # F: ROE (股東權益報酬率) - 代表公司賺錢效率
-        roe = ticker_info.get('returnOnEquity', 0)
-        
-        # F: PEG (本益成長比) - 大戶找便宜的關鍵
-        # 如果抓不到 PEG，我們嘗試自己算: PE / (Growth*100)
-        peg = ticker_info.get('pegRatio', None)
-        pe = ticker_info.get('trailingPE', None)
-        if peg is None and pe and rev_growth > 0:
-            peg = pe / (rev_growth * 100)
+        # 只有當預期報酬率 > 成長率，Gordon 模型才有效
+        if dividend_rate and dividend_rate > 0 and expected_return > G_GROWTH:
+            # P = D / (K - g)
+            theoretical_price = dividend_rate / (expected_return - G_GROWTH)
+            fair_value = round(theoretical_price, 2)
+            # 計算折價幅度 (正值代表被低估)
+            undervalued_pct = (theoretical_price - close) / close
 
-        # --- 2. 計算技術面因子 (Momentum) ---
-        # 均線
-        ma20 = data['Close'].rolling(20).mean().iloc[-1]
-        ma60 = data['Close'].rolling(60).mean().iloc[-1] # 生命線
+        # --- C. Fama-French 三因子準備 ---
+        # SMB (規模): 市值
+        market_cap = ticker_info.get('marketCap', 0)
+        is_small_cap = market_cap < 50000000000 # 假設 500億以下為中小型
         
-        # 乖離率 (Bias): 用來判斷是否「追高」
+        # HML (價值): 淨值市價比 (B/M) = 1 / PB
+        pb_ratio = ticker_info.get('priceToBook', 0)
+        is_value_stock = 0 < pb_ratio < 1.5 # 低 PB 代表價值型
+
+        # --- D. MPT 風險 (標準差) ---
+        volatility = stock_returns.std() * (252**0.5) # 年化波動率
+
+        # --- E. 技術面 (Momentum) ---
+        ma60 = data['Close'].rolling(60).mean().iloc[-1]
         bias_60 = (close - ma60) / ma60
-        
-        # 成交量均線
         vol_ma5 = data['Volume'].rolling(5).mean().iloc[-1]
         
-        # MACD
-        macd = ta.trend.MACD(data['Close'])
-        macd_diff = macd.macd_diff().iloc[-1]
-        macd_diff_prev = macd.macd_diff().iloc[-2]
-
-        # --- 3. 大戶評分系統 (Scoring) ---
+        # --- 評分系統 (Weighted Score) ---
         score = 0
         factors = []
         
-        # === 守門員：乖離率濾網 ===
-        # 如果股價已經離季線太遠 (> 25%)，大戶不會追，我們也不追
-        if bias_60 > 0.25: return None
-        # 如果還在深海空頭排列 (季線下方 > 15%)，也不是好買點
-        if bias_60 < -0.15: return None
-
-        # === 因子加分區 ===
+        # 1. 估值因子 (Gordon Model & Value)
+        if isinstance(fair_value, float) and fair_value > close:
+            score += 25
+            factors.append(f"💰 低於理論價({fair_value})")
         
-        # [G] 成長因子: 營收高成長 (+20分)
-        if rev_growth and rev_growth > 0.20:
-            score += 20
-            factors.append(f"📈 營收爆發(+{round(rev_growth*100)}%)")
-            
-        # [F] 價值因子: PEG 低估 (+15分)
-        if peg and 0 < peg < 1.0:
+        if is_value_stock: # Fama-French HML
             score += 15
-            factors.append(f"💎 價值低估(PEG {round(peg, 2)})")
-            
-        # [F] 品質因子: 高 ROE (+10分)
-        if roe and roe > 0.15:
-            score += 10
-            factors.append(f"👑 高效能(ROE {round(roe*100)}%)")
+            factors.append(f"💎 價值股(PB {round(pb_ratio, 2)})")
 
-        # [M] 狙擊手因子 1: 剛站上季線 (+20分)
-        # 這是第一浪/第二浪轉強的特徵
-        if close > ma60 and (close - ma60)/ma60 < 0.05:
+        # 2. 規模因子 (SMB)
+        if is_small_cap: # Fama-French SMB
+            score += 10 # 根據統計，小型股有超額報酬
+            factors.append("🔹 小型股溢酬")
+
+        # 3. 獲利因子 (Quality)
+        roe = ticker_info.get('returnOnEquity', 0)
+        if roe > 0.15:
+            score += 15
+            factors.append(f"👑 高ROE({round(roe*100)}%)")
+
+        # 4. 技術因子 (Momentum & Sniper)
+        # 剛站上季線且乖離不大
+        if close > ma60 and 0 < bias_60 < 0.10:
             score += 20
             factors.append("🎯 剛站上季線")
-        elif close > ma60:
-            score += 10 # 站上但有點距離
-
-        # [M] 狙擊手因子 2: 主力吸籌 (+20分)
-        # 量增 (1.5倍) 但價穩 (漲幅 < 5%) -> 大戶偷偷買
-        pct_change = (close - prev['Close']) / prev['Close']
-        vol_ratio = volume / vol_ma5
-        if vol_ratio > 1.5 and 0 < pct_change < 0.05:
-            score += 20
-            factors.append(f"🤫 主力吸籌(量增{round(vol_ratio,1)}倍)")
-        elif vol_ratio > 2.0:
-            score += 10
-            factors.append("🔥 爆量攻擊")
-
-        # [M] 狙擊手因子 3: MACD 轉折 (+15分)
-        if macd_diff > 0 and macd_diff_prev <= 0:
+        
+        # 5. 籌碼因子 (Volume)
+        if volume > 1.5 * vol_ma5:
             score += 15
-            factors.append("⚡ MACD翻紅")
+            factors.append("🔥 量能放大")
 
-        # 總分門檻 (稍微放寬到 50 分，確保有結果，然後我們看排名)
-        if score >= 50:
+        # 6. 風險調整 (Risk Penalty)
+        if volatility > 0.5: # 波動太大扣分
+            score -= 10
+            factors.append("⚠️ 高波動")
+
+        # 門檻
+        if score >= 60:
             return {
                 "Ticker": ticker_symbol,
                 "Name": name_map.get(ticker_symbol, ticker_symbol),
                 "Close": round(close, 2),
                 "Score": score,
-                "Bias": f"{round(bias_60*100, 1)}%",
-                "Factors": " | ".join(factors),
-                "PEG": round(peg, 2) if peg else "N/A",
-                "Growth": f"{round(rev_growth*100)}%" if rev_growth else "N/A"
+                "Fair_Value": fair_value, # 合理股價
+                "Beta": round(beta, 2), # 系統風險
+                "Exp_Return": f"{round(expected_return*100, 1)}%", # 要求報酬
+                "Factors": " | ".join(factors)
             }
-            
+
     except:
         return None
     return None
 
 # --- Streamlit 頁面 ---
 
-st.set_page_config(page_title="Miniko FGM 狙擊手 V6", layout="wide")
+st.set_page_config(page_title="Miniko 投資理論實戰版 V7", layout="wide")
 
-st.title("🏹 Miniko & 曜鼎豐 - 全市場 F-G-M 狙擊手")
+st.title("📊 Miniko & 曜鼎豐 - 投資理論實戰模型 V7")
 st.markdown("""
-### 策略邏輯：
-* **F (基本面)**：尋找被低估 (PEG<1) 且高效能 (ROE>15%) 的好公司。
-* **G (成長面)**：營收年增率 > 20%，確保動能。
-* **M (技術面)**：**拒絕追高！** 鎖定剛站上季線、主力吸籌的起漲點 (第一浪)。
+### 📚 應用理論模型：
+* **CAPM (資本資產定價)**：計算 Beta 與 預期報酬率 (資金成本)。
+* **Gordon Model (股利折現)**：利用 CAPM 算出的成本，推導 **合理股價 (Fair Value)**。
+* **Fama-French (三因子)**：加權 **小型股 (SMB)** 與 **價值股 (HML)**。
+* **MPT (現代投資組合)**：監控波動率 ($\sigma$)，優化風險回報。
 """)
 
 if 'results' not in st.session_state:
@@ -195,22 +202,25 @@ if 'results' not in st.session_state:
 col1, col2 = st.columns([1, 3])
 
 with col1:
-    st.info("💡 說明：掃描全台 1800+ 檔股票約需 20 分鐘。只要發現符合 FGM 模型的好股，右側會即時顯示。")
+    st.info("💡 系統將計算全台股的 Beta 值與理論價格，運算量較大，約需 20-25 分鐘。")
     
-    if st.button("🚀 啟動全市場 FGM 掃描", type="primary"):
-        with st.spinner("正在讀取 twstock 字典資料庫..."):
+    if st.button("🚀 啟動理論模型掃描", type="primary"):
+        with st.spinner("Step 1: 下載大盤指數計算 Beta 基準..."):
+            market_returns = get_market_data()
+        
+        with st.spinner("Step 2: 讀取 twstock 字典..."):
             tickers, name_map = get_all_tw_tickers()
             
-        st.success(f"成功載入 {len(tickers)} 檔股票！開始大戶邏輯分析...")
+        st.success(f"基準設定完成！開始分析 {len(tickers)} 檔股票的 CAPM 與估值...")
         st.session_state['results'] = [] 
         
         progress_bar = st.progress(0)
         status_text = st.empty()
         result_placeholder = col2.empty() 
         
-        # 開啟多執行緒加速 (16核心)
+        # 16 核心平行運算
         with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
-            future_to_ticker = {executor.submit(calculate_fgm_score, t, name_map): t for t in tickers}
+            future_to_ticker = {executor.submit(calculate_theoretical_factors, t, name_map, market_returns): t for t in tickers}
             
             completed_count = 0
             found_count = 0
@@ -219,45 +229,42 @@ with col1:
                 data = future.result()
                 completed_count += 1
                 
-                # 每 50 檔更新一次進度條
                 if completed_count % 50 == 0:
                     progress_bar.progress(completed_count / len(tickers))
-                    status_text.text(f"掃描進度: {completed_count}/{len(tickers)} | 已發現: {found_count} 檔")
+                    status_text.text(f"分析進度: {completed_count}/{len(tickers)} | 符合理論標的: {found_count}")
                 
                 if data:
                     found_count += 1
                     st.session_state['results'].append(data)
                     
-                    # 即時排序並顯示
                     df_realtime = pd.DataFrame(st.session_state['results'])
                     df_realtime = df_realtime.sort_values(by='Score', ascending=False)
                     
                     with result_placeholder.container():
-                        st.subheader(f"🎯 發現 FGM 潛力股 ({found_count} 檔)")
-                        # 顯示關鍵欄位
+                        st.subheader(f"🎯 理論價值選股 ({found_count} 檔)")
+                        # 顯示包含理論數值的表格
                         st.dataframe(
-                            df_realtime[['Name', 'Ticker', 'Close', 'Score', 'Bias', 'Factors', 'PEG', 'Growth']], 
+                            df_realtime[['Name', 'Ticker', 'Close', 'Fair_Value', 'Score', 'Exp_Return', 'Beta', 'Factors']], 
                             use_container_width=True,
                             hide_index=True
                         )
 
-        status_text.text("✅ 全市場掃描完成！")
+        status_text.text("✅ 全市場理論分析完成！")
         
-        # 發送 Telegram 通知
         if st.session_state['results']:
             df_final = pd.DataFrame(st.session_state['results']).sort_values(by='Score', ascending=False)
             top_5 = df_final.head(5)
-            msg = f"🏹 **【Miniko FGM 狙擊報告】**\n發現 {len(df_final)} 檔潛力股，前五名：\n"
+            msg = f"📊 **【Miniko 理論模型報告】**\n"
             for _, row in top_5.iterrows():
-                msg += f"• {row['Name']} ({row['Ticker']}) {row['Close']}元 | 分數:{row['Score']}\n"
+                msg += f"• {row['Name']} ({row['Ticker']}) 現價:{row['Close']} | 合理價:{row['Fair_Value']}\n"
             send_telegram_message(msg)
 
 with col2:
     if not st.session_state['results']:
-        st.write("👈 點擊左側按鈕開始，這次保證能跑出全市場結果！")
+        st.write("👈 點擊左側按鈕，讓 AI 用華爾街模型幫您算股價！")
     else:
         df_show = pd.DataFrame(st.session_state['results'])
-        st.subheader(f"🎯 最終篩選結果 ({len(df_show)} 檔)")
+        st.subheader(f"🎯 最終評價結果 ({len(df_show)} 檔)")
         st.dataframe(
             df_show.sort_values(by='Score', ascending=False), 
             use_container_width=True, 
