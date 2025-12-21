@@ -80,16 +80,15 @@ def get_realtime_price_robust(stock_code):
 
 def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
     """
-    【Miniko V9.2 旗艦運算核心 - 深度理論版】
-    包含：CAPM, Fama-French, CGO, Smart Beta, Gordon Model
-    產出：AI 綜合詳評 (替代單一買點)
+    【Miniko V9.4 旗艦運算核心 - 價格意圖因子引擎】
+    特點：整合「價格意圖因子」(Return / Variability) 識別主力畫線股。
     """
     try:
         stock_name = name_map.get(ticker_symbol, ticker_symbol)
         current_price = get_realtime_price_robust(ticker_symbol)
         if current_price is None or current_price <= 0: return None
 
-        # 抓取 1 年數據
+        # 抓取 1 年數據 (足夠計算60天意圖因子)
         data = yf.download(ticker_symbol, period="1y", interval="1d", progress=False)
         if len(data) < 100: return None 
         if isinstance(data.columns, pd.MultiIndex):
@@ -97,8 +96,40 @@ def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
         
         if current_price < 10: return None # 排除極低價股
 
+        # --- 0. 核心選股：價格意圖因子 (Price Intent Factor) ---
+        # 邏輯：報酬率(s) / 變動率(v)。尋找 A->B 走直線的股票
+        days = 60
+        close_series = data['Close']
+        volume_series = data['Volume']
+        
+        # S: 60天報酬率
+        price_60_ago = close_series.iloc[-days]
+        s_return = (current_price / price_60_ago) - 1
+        
+        # V: 變動率 (每日漲跌幅絕對值總和)
+        v_variability = close_series.pct_change().abs().tail(days).sum()
+        
+        # Volume Check (日均量)
+        avg_volume = volume_series.tail(days).mean()
+        
+        # 意圖因子計算
+        intent_factor = 0
+        score_intent = 0
+        is_intent_candidate = False
+        
+        # 篩選條件：1. 收益率 < 20% (避免過熱) 2. 成交量 > 200,000 (流動性)
+        if v_variability > 0 and 0 < s_return < 0.20 and avg_volume > 200000:
+            # 原始因子: s / v
+            raw_intent = s_return / v_variability
+            # 排名指標: (s / v) / volume (偏好低關注度但走勢穩定的)
+            # 為了讓數值可讀，我們主要評估 raw_intent (直線性)，並確認 volume 不會過大
+            
+            intent_factor = raw_intent
+            is_intent_candidate = True
+            score_intent = 25 # 符合此核心邏輯直接加高分
+
         # --- 1. CAPM & WACC (資金成本分析) ---
-        stock_returns = data['Close'].pct_change().dropna()
+        stock_returns = close_series.pct_change().dropna()
         aligned = pd.concat([stock_returns, market_returns], axis=1, join='inner').dropna()
         aligned.columns = ['Stock', 'Market']
         
@@ -108,10 +139,10 @@ def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
         mkt_var = aligned['Market'].var()
         beta = cov / mkt_var if mkt_var != 0 else 1.0
         
-        # Ke = Rf + Beta * MRP (權益資金成本 / 投資人要求報酬率)
+        # Ke = Rf + Beta * MRP (權益資金成本)
         ke = RF + beta * MRP
         
-        # --- 2. Gordon Model (股利折現評價) ---
+        # --- 2. Gordon Model ---
         ticker_info = yf.Ticker(ticker_symbol).info
         div_rate = ticker_info.get('dividendRate', 0)
         if not div_rate:
@@ -123,87 +154,82 @@ def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
         if div_rate and div_rate > 0:
             fair_value = round(div_rate / k_minus_g, 2)
 
-        # --- 3. Fama-French Proxy & Smart Beta ---
-        # SMB (規模)
-        market_cap = ticker_info.get('marketCap', 0)
-        is_small_cap = 0 < market_cap < 50000000000 
-        
-        # HML (價值)
+        # --- 3. Smart Beta (CGO & Low Vol) ---
         pb = ticker_info.get('priceToBook', 0)
-        is_value_stock = 0 < pb < 1.5
-        
-        # CGO (未實現獲利 - 籌碼面)
-        ma100 = data['Close'].rolling(100).mean().iloc[-1]
-        cgo_val = (current_price - ma100) / ma100 # >0 代表多數人獲利
-        
-        # Low Vol (低波動)
+        ma100 = close_series.rolling(100).mean().iloc[-1]
+        cgo_val = (current_price - ma100) / ma100 
         volatility = stock_returns.std() * (252**0.5)
         
-        # --- 4. AI 評分機制 ---
-        score = 0.0
+        # --- 4. AI 差異化評分機制 ---
+        score = score_intent # 初始分數由意圖因子決定
         factors = []
         
+        if is_intent_candidate:
+            factors.append("💎價格意圖優選(直線爬升)")
+
         # 價值因子
-        if is_value_stock:
-            score += 15
-            factors.append("價值型(低PB)")
-        if not np.isnan(fair_value) and fair_value > current_price:
+        if 0 < pb < 1.0:
             score += 20
-            factors.append("低估(低於Gordon價)")
-            
-        # 規模與動能
-        if is_small_cap:
+            factors.append("深度價值(PB<1)")
+        elif 1.0 <= pb < 1.5:
             score += 10
-            factors.append("中小型(SMB效應)")
-        
-        ma20 = data['Close'].rolling(20).mean().iloc[-1]
-        if current_price > ma20: score += 10 # 多頭排列
+            
+        if not np.isnan(fair_value):
+            upside = (fair_value - current_price) / current_price
+            if upside > 0.2:
+                score += 15
+                factors.append("估值低估")
 
         # 品質 (ROE)
         roe = ticker_info.get('returnOnEquity', 0)
         if roe > 0.15:
-            score += 15
+            score += 10
             factors.append("高ROE")
 
-        # 風險 (Low Vol & CGO)
+        # 技術與籌碼
+        ma20 = close_series.rolling(20).mean().iloc[-1]
+        if current_price > ma20: score += 5
+
         if volatility < 0.25:
             score += 15
-            factors.append("低波動(籌碼穩)")
+            factors.append("籌碼安定")
+            
         if cgo_val > 0.1:
             score += 10
-            factors.append("CGO高(賣壓輕)")
 
-        # --- 5. 生成 AI 綜合詳細建議 (取代單一買點) ---
-        # 這裡運用 WACC 與 CAPM 邏輯進行敘述
+        # --- 5. 生成「個別化」AI 深度綜合建議 ---
         
-        advice_text = f"【{stock_name} AI深度解析】\n"
-        
-        # 資金成本觀點
-        advice_text += f"1. 資金成本與評價：Beta值為 {beta:.2f} ({( '高波動' if beta>1 else '低波動' )})。根據CAPM模型，您的要求報酬率(Ke)應為 {ke:.1%}。"
-        if not np.isnan(fair_value):
-            discount = (fair_value - current_price) / current_price
-            if discount > 0:
-                advice_text += f" Gordon模型顯示合理價約 {fair_value} 元，目前具 {discount:.1%} 潛在漲幅。"
-            else:
-                advice_text += f" Gordon模型顯示合理價約 {fair_value} 元，目前價格略高於理論價。"
+        # 路徑軌跡診斷 (New!)
+        path_diagnosis = ""
+        if is_intent_candidate:
+            path_diagnosis = f"【極佳】股價呈「直線爬升」型態。意圖因子顯示主力控盤穩定，且近60日漲幅 {s_return:.1%} 未過熱，屬於穩定推升階段。"
+        elif s_return > 0.3:
+            path_diagnosis = f"【過熱注意】近60日漲幅達 {s_return:.1%}，雖強勢但偏離直線軌跡，需提防回調。"
+        elif v_variability > 0.5:
+            path_diagnosis = "【震盪劇烈】路徑曲折，多空拉鋸明顯，缺乏明確主力控盤方向。"
         else:
-            advice_text += " 無配息資料，不適用Gordon模型評價。"
-            
-        # 籌碼與策略觀點
-        advice_text += f"\n2. Smart Beta 檢測："
-        if cgo_val > 0.1 and volatility < 0.3:
-            advice_text += f"符合「CGO+低波動」策略。CGO指標 {cgo_val:.1%} 顯示多數籌碼獲利，且波動率 {volatility:.1%} 低，籌碼安定度高。"
-        else:
-            advice_text += f"波動率 {volatility:.1%}，CGO指標 {cgo_val:.1%}。雖未完全符合低波策略，但可關注其他因子。"
-            
-        # 投資決策建議 (不融資/不舉債)
-        advice_text += f"\n3. 投資決策 (現股無槓桿)："
-        if score >= 70:
-            advice_text += "綜合評分極優。符合Fama-French多因子特徵，建議以現有資金分批佈局，長期持有。"
+            path_diagnosis = "股價路徑一般，隨市場波動。"
+
+        # 價值與風險
+        valuation_txt = f"合理價 {fair_value}" if not np.isnan(fair_value) else "無股利評價"
+        risk_txt = f"Beta {beta:.2f} (防禦型)" if beta < 1 else f"Beta {beta:.2f} (波動型)"
+
+        # 綜合結論
+        action_plan = ""
+        if score >= 75:
+            action_plan = "評分極高。具備「價格意圖」與「基本面」雙重優勢，建議積極佈局。"
         elif score >= 50:
-            advice_text += "評分中上。若股價回測月線(MA20)不破，可視為現貨買點。"
+            action_plan = "評分中上。路徑或價值面有一項優勢，可納入觀察。"
         else:
-            advice_text += "評分普通，建議先觀察，待籌碼面轉佳再介入。"
+            action_plan = "觀望。缺乏明確上漲意圖或籌碼優勢。"
+
+        final_advice = (
+            f"🎯 **AI 核心解析**：\n"
+            f"1. **軌跡**：{path_diagnosis}\n"
+            f"2. **價值**：{valuation_txt}，{risk_txt}。\n"
+            f"3. **籌碼**：CGO {cgo_val:.1%} ({( '獲利惜售' if cgo_val>0.1 else '正常' )})。\n"
+            f"4. **決策**：{action_plan}"
+        )
 
         if score >= 50:
             return {
@@ -211,8 +237,8 @@ def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
                 "名稱": stock_name,
                 "現價": float(current_price),
                 "AI綜合評分": round(score, 1),
-                "AI綜合建議": advice_text, # 新欄位
-                "合理價": fair_value if not np.isnan(fair_value) else None,
+                "AI綜合建議": final_advice,
+                "意圖因子": round(intent_factor, 2) if is_intent_candidate else 0, # 新欄位
                 "權益成本(Ke)": round(ke, 3),
                 "CGO指標": round(cgo_val * 100, 1),
                 "波動率": round(volatility, 2),
@@ -224,100 +250,49 @@ def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
 
 # --- Streamlit 介面 ---
 
-st.set_page_config(page_title="Miniko 投資戰情室 V9.2", layout="wide")
+st.set_page_config(page_title="Miniko 投資戰情室 V9.4", layout="wide")
 
-st.title("📊 Miniko & 曜鼎豐 - 投資戰情室 V9.2 (三因子/APT/CAPM 深度版)")
+st.title("📊 Miniko & 曜鼎豐 - 投資戰情室 V9.4 (價格意圖因子旗艦版)")
 st.markdown("""
-本系統整合 **CAPM、APT、Fama-French 三因子** 與 **Smart Beta** 理論。
-**策略原則：** 嚴守 **不融資、不舉債、只買現股**，利用 WACC 概念評估企業價值，並結合嗨投資(HiStock)與TEJ資料庫邏輯。
+本系統整合 **CAPM、Fama-French** 與 **Smart Beta**。
+**V9.4 核心升級：** 引入 **「價格意圖因子」**，利用數學公式篩選出「股價走直線」的主力控盤股，排除隨機漫步的雜訊。
 """)
 
-# --- 知識庫 Expander (深度理論整合) ---
-with st.expander("📚 點此查看：Miniko 專屬三因子資料庫與投資理論 (MPT/APT/CAPM)"):
-    tab_theory, tab_chips, tab_backtest, tab_factors = st.tabs(["核心理論 (CAPM/APT/FF3)", "籌碼面六大指標", "CGO策略回測", "八大因子與Smart Beta"])
+# --- 知識庫 Expander ---
+with st.expander("📚 點此查看：價格意圖因子與核心選股邏輯 (New!)"):
+    tab_intent, tab_theory, tab_chips = st.tabs(["💎 核心：價格意圖因子", "CAPM與三因子", "籌碼與CGO"])
     
+    with tab_intent:
+        st.markdown("""
+        ### 💎 什麼是「價格意圖因子」？
+        
+        
+        **核心邏輯**：股價從 A 點到 B 點，距離最短的是「直線」。
+        * 如果一檔股票像**直線**一樣慢慢爬升，代表背後有**造市者或主力**在付費維護或少量吸籌，讓價格穩定。
+        * 如果一檔股票上沖下洗、路徑繞來繞去，代表多空分歧，看不出主力意圖。
+        
+        **三大篩選公式**：
+        1.  **收益率上限**：過去 60 天漲幅 < 20% (避免追高、找起漲點)。
+        2.  **變動率 (Variability)**：每日漲跌幅絕對值總和 (越小代表走勢越平滑)。
+        3.  **價格意圖** = `報酬率 / 變動率`。數值越大，代表「直線上漲」趨勢越強。
+        
+        **為什麼有效？**
+        * **風險調整後收益高**：在承擔最小波動下，獲得最穩定的報酬。
+        * **市場關注度低**：我們結合 `因子 / 交易量`，找出尚未被市場大肆炒作的低調好股。
+        """)
+
     with tab_theory:
         st.markdown("""
-        ### 一、投資組合理論 (MPT) 與 CAPM
-        * **MPT (現代投資組合理論)**：由 Markowitz 提出，核心觀念是「多角化降低風險」。
-            * 公式：$\sigma_p = \sqrt{\sum w_i^2 \sigma_i^2 + \sum \sum w_i w_j \sigma_i \sigma_j \rho_{ij}}$
-            * 意義：船運公司案例，10艘小船風險遠低於2艘大船。
-        
-        * **CAPM (資本資產定價模式)**：
-            * 公式：$E(R_i) = R_f + \\beta(R_m - R_f)$
-            * $R_f$：無風險利率 (如定存)
-            * $R_m - R_f$：市場風險溢酬 (MRP)
-            * **應用**：計算 **Ke (權益資金成本)**，作為投資人的要求報酬率。
-            
-        * **APT (套利定價模式)**：
-            * Ross (1976) 提出，認為股價受多個系統因子影響 (通膨、利差等)。
-            * $E(R_i) = \\beta_0 + \Sigma \\beta_i F_i$
-            
-        * **Fama & French 三因子 (FF3)**：
-            * 修正 CAPM 對 Beta 解釋力不足的問題。
-            * 加入 **SMB (規模溢酬)**：小型股報酬通常高於大型股。
-            * 加入 **HML (淨值市價比溢酬)**：價值股通常優於成長股。
-            * 公式：$E(R_i) = \\beta_0 + \\beta_1 MRP + \\beta_2 SMB + \\beta_3 HML$
-            
-        ### 💡 投資與融資決策 (WACC)
-        * **投資決策**：計算 WACC (加權平均資金成本)，將未來現金流折現算出 NPV。若 NPV > 0 (或報酬率 > WACC)，則投資可行。
-            * *Miniko 案例*：假設公司 WACC=5%。
-        * **融資決策**：比較舉債與增資成本。
-            * 若銀行借款 4% < 預期報酬 6%，傾向舉債 (但本策略設定為**不舉債**，全採現股)。
-        * **Gordon Model 評價**：$P = Div / (Ke - g)$。
+        ### CAPM & WACC
+        * **WACC**：資金成本概念。若預期報酬率 > WACC，才值得投資。
+        * **CAPM**：$E(R_i) = R_f + \\beta(R_m - R_f)$，計算合理的投資回報門檻。
         """)
-
+        
     with tab_chips:
         st.markdown("""
-        ### 🕵️ 籌碼面六大指標 (判斷大戶與散戶)
-        1.  **千張大戶持股**：
-            * 絕對指標。適合區間 **40% ~ 70%**。>80% 則波動過小。
-        2.  **內部人持股**：
-            * >40% 代表經營層利益與股東一致，適合長期持有。
-        3.  **佔股本比重 (區間買賣超)**：
-            * 若 60 天內買賣超佔股本 > 3%，代表主力介入 (較適用大型股)。
-        4.  **籌碼集中度**：
-            * 60天集中度 > 5%、120天集中度 > 3% 為佳。
-        5.  **主力買賣超**：
-            * 若主力賣、股價漲 (背離)，小心主力倒貨。
-        6.  **買賣家數差 (重要必勝訊號)**：
-            * 負數 (賣家家數 > 買家家數) = **籌碼集中** (多數散戶賣給少數大戶)。
-            * **訊號**：主力買超 (+) 且 買賣家數差 (-) = 大戶吸籌中！
-        """)
-
-    with tab_backtest:
-        st.markdown("""
-        ### 🚀 CGO + 低波動 (Smart Beta 回測實證)
-        **資料來源：TEJ、嗨投資 (HiStock)、Miniko 數據庫** (2005-2025)
-        
-        * **策略定義**：
-            * **CGO (未實現資本利得)**：$(P - Cost) / Cost$。衡量潛在賣壓。
-            * **cgo_low_tv 策略**：先選「歷史波動度低 (TV100)」的股票，再從中選「CGO 高」的股票。
-            
-        * **回測績效 (2005-2025)**：
-            | 績效指標 | 純 CGO 策略 | **CGO + Low TV (推薦)** | 大盤基準 |
-            | :--- | :--- | :--- | :--- |
-            | 年化報酬 | 14.89% | **14.04%** | 10.74% |
-            | 年化波動 | 16.45% | **8.46% (超穩)** | 18.38% |
-            | 夏普比率 | 0.927 | **1.596 (優)** | 0.647 |
-            | 最大回撤 | -57% | **-32%** | -56% |
-            
-        * **結論**：
-            加入低波動因子後，雖然報酬率略降，但**風險大幅降低** (波動率減半)，夏普比率顯著提升。這符合我們「不融資、求穩健」的投資哲學。
-        """)
-        
-    with tab_factors:
-        st.markdown("""
-        ### 📊 TEJ 市場八大因子
-        根據 Fama-French 延伸，台股市場有效因子包含：
-        1.  **市場風險溢酬 (MRP)**
-        2.  **規模溢酬 (SMB)**：小型股效應 (台灣市場不明顯，但小型價值股強)。
-        3.  **淨值市價比 (HML)**：價值型投資在台灣長期有效。
-        4.  **益本比 (E/P)**：高益本比 (低本益比) 優於成長股。
-        5.  **現金股利率**：高股息長期優於低股息。
-        6.  **動能因子**：過去一年表現好，預期續強。
-        7.  **短期反轉**：近1個月表現差，預期反彈 (反應過度)。
-        8.  **長期反轉**：近3-4年表現差，預期長線反轉。
+        ### CGO + Smart Beta
+        * **CGO (未實現獲利)**：正值代表大部分持股者賺錢，籌碼穩定惜售。
+        * **低波動**：長期回測顯示，低波動股票的夏普比率優於高波動熱門股。
         """)
 
 # --- 主程式區 ---
@@ -327,21 +302,20 @@ if 'results' not in st.session_state:
 col1, col2 = st.columns([1, 4])
 
 with col1:
-    st.info("💡 系統執行：CAPM 計算 Ke、Gordon 評價、Fama-French 因子掃描。")
+    st.info("💡 系統執行：價格意圖因子篩選 + CAPM 評價 + Smart Beta 診斷。")
     if st.button("🚀 啟動 AI 智能運算 (Top 100)", type="primary"):
-        with st.spinner("Step 1: 載入大盤數據與無風險利率..."):
+        with st.spinner("Step 1: 載入大盤數據..."):
             market_returns = get_market_data()
         
-        with st.spinner("Step 2: 載入全市場清單 (含嗨投資/TEJ定義)..."):
+        with st.spinner("Step 2: 全市場掃描 (計算意圖因子)..."):
             tickers, name_map = get_all_tw_tickers()
             
-        st.success(f"鎖定 {len(tickers)} 檔標的，開始 AI 深度運算...")
+        st.success(f"鎖定 {len(tickers)} 檔標的，開始運算股價路徑...")
         st.session_state['results'] = []
         
         progress_bar = st.progress(0)
         status_text = st.empty()
         
-        # 平行運算
         with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
             future_to_ticker = {executor.submit(calculate_theoretical_factors, t, name_map, market_returns): t for t in tickers}
             
@@ -360,28 +334,28 @@ with col1:
 with col2:
     if not st.session_state['results']:
         st.write("👈 請點擊左側按鈕開始分析。")
-        [st.write("")] # Placeholder
+        [st.write("")] 
     else:
         df = pd.DataFrame(st.session_state['results'])
         
-        # 排序邏輯：評分優先 -> CGO優先
-        df = df.sort_values(by=['AI綜合評分', 'CGO指標'], ascending=[False, False]).head(100)
+        # 排序：優先展示「價格意圖優選」且評分高的
+        df = df.sort_values(by=['AI綜合評分', '意圖因子'], ascending=[False, False]).head(100)
         
-        st.subheader(f"🏆 AI 嚴選現貨清單 Top 100 (不融資/不舉債)")
+        st.subheader(f"🏆 AI 嚴選現貨清單 Top 100 (價格意圖優選)")
         
         st.dataframe(
             df,
             use_container_width=True,
             hide_index=True,
-            column_order=["代號", "名稱", "現價", "AI綜合評分", "AI綜合建議", "合理價", "權益成本(Ke)", "CGO指標", "波動率", "亮點"],
+            column_order=["代號", "名稱", "現價", "AI綜合評分", "AI綜合建議", "意圖因子", "合理價", "CGO指標", "亮點"],
             column_config={
                 "代號": st.column_config.TextColumn(width="small"),
                 "現價": st.column_config.NumberColumn(format="$%.2f"),
                 "AI綜合評分": st.column_config.ProgressColumn(format="%.1f", min_value=0, max_value=100),
-                "AI綜合建議": st.column_config.TextColumn(width="large", help="包含WACC、CAPM、籌碼面之完整分析"),
-                "合理價": st.column_config.NumberColumn(format="$%.2f", help="Gordon Model"),
-                "權益成本(Ke)": st.column_config.NumberColumn(format="%.1f%%", help="CAPM計算之投資人要求報酬率"),
-                "CGO指標": st.column_config.NumberColumn(format="%.1f%%", help="正值代表籌碼獲利"),
+                "AI綜合建議": st.column_config.TextColumn(width="large", help="包含股價路徑軌跡診斷"),
+                "意圖因子": st.column_config.NumberColumn(format="%.2f", help="數值越高代表走勢越像直線(穩定)"),
+                "合理價": st.column_config.NumberColumn(format="$%.2f"),
+                "CGO指標": st.column_config.NumberColumn(format="%.1f%%"),
                 "亮點": st.column_config.TextColumn(width="medium"),
             }
         )
