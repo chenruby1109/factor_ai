@@ -81,9 +81,9 @@ def get_realtime_price_robust(stock_code):
 
 def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
     """
-    【Miniko V9.4 旗艦運算核心 - 同步決策版】
+    【Miniko V9.2 旗艦運算核心 - 實戰買點優化版】
     整合 CAPM, Fama-French, CGO, Smart Beta
-    V9.4 修正：確保「建議買點」與「AI決策」邏輯一致，消除落差感。
+    新增：動態位階買點 (Dynamic Entry Point) - 確保買點與現價不會脫節
     """
     try:
         current_price = get_realtime_price_robust(ticker_symbol)
@@ -146,7 +146,7 @@ def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
         if cgo_val > 0.1 and volatility < 0.3:
             strategy_tags.append("🔥CGO低波優選") # 獲利中且波動低
         
-        # --- 5. AI 綜合評分系統 (V9.4 升級版) ---
+        # --- 5. AI 綜合評分系統 (V9.2 升級版) ---
         score = 0.0
         factors = []
 
@@ -194,79 +194,58 @@ def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
         elif volatility > 0.5:
             score -= 10
             
-        # --- 6. 建議買入點位與 AI 決策同步計算 (修正邏輯) ---
+        # --- 6. 建議買入點位計算 (V9.2 實戰掛單邏輯) ---
+        # 邏輯核心：不做太遠的夢，根據「乖離率」判斷是該追 MA10 還是等 MA60
         
-        # 步驟 1: 先找出「技術上的理想支撐點」(Technical Anchor)
-        # 這不一定是最後的建議買點，而是作為衡量乖離率的基準
-        bias_ma20 = (current_price - ma20) / ma20 
-        anchor_price = ma20
-        anchor_note = "MA20"
-
+        bias_ma20 = (current_price - ma20) / ma20 # 與月線的乖離率
+        
+        # 預設值
+        buy_suggestion = ma20 
+        buy_note = "月線支撐"
+        
+        # 狀況 A: 多頭強勢股 (股價 > 月線)
         if current_price > ma20:
-            if bias_ma20 > 0.1: # 強勢噴出
-                anchor_price = ma10
-                anchor_note = "MA10"
-            elif bias_ma20 > 0.04: # 正常多頭
-                anchor_price = ma20
-                anchor_note = "MA20"
-            else: # 貼近月線
-                anchor_price = ma20
-                anchor_note = "MA20"
-        else:
-             # 跌破月線
-            if current_price > ma60:
-                anchor_price = ma60
-                anchor_note = "MA60"
+            if bias_ma20 > 0.1: 
+                # 乖離 > 10% (噴出段)：等月線會買不到，改掛 MA10 或 MA5
+                buy_suggestion = ma10
+                buy_note = "強勢回檔(MA10)"
+            elif bias_ma20 > 0.04:
+                # 乖離 4%~10% (正常趨勢)：掛月線即可
+                buy_suggestion = ma20
+                buy_note = "趨勢支撐(MA20)"
             else:
-                anchor_price = current_price * 0.95 # 超跌緩衝
-                anchor_note = "超跌區"
-                if not np.isnan(fair_value) and (current_price * 0.85) < fair_value < current_price:
-                     anchor_price = fair_value
-                     anchor_note = "合理價"
-
-        # 步驟 2: 計算現價與理想支撐的距離 (Gap)
-        # 用來判斷要「追價(現價買)」還是「等待(掛單買)」
-        gap_percent = (current_price - anchor_price) / current_price
+                # 乖離 < 4% (就在月線邊)：直接掛現價下方一點點，確保成交
+                buy_suggestion = current_price * 0.985
+                buy_note = "貼近月線(現價佈局)"
         
-        # 步驟 3: 綜合決策與定價
-        ai_advice = "⏳ 觀望"
-        final_buy_price = anchor_price # 預設為支撐價
-        final_buy_note = f"{anchor_note}支撐"
-
-        if score >= 60:
-            # 邏輯修正：如果在支撐上方 3% 以內，視為「可進場區間」
-            if gap_percent <= 0.03: 
-                if score >= 80:
-                    ai_advice = "🚀 強力買進"
-                else:
-                    ai_advice = "✅ 建議買進"
-                
-                # 關鍵修正：既然建議買進，買點就不能是遙遠的支撐，而是「現價」或「現價略低」
-                # 這樣使用者可以直接操作，不會困惑
-                final_buy_price = current_price 
-                final_buy_note = f"現價進場 (防守{anchor_note})"
-            
-            else:
-                # 距離支撐太遠 (>3%)，建議等待
-                wait_percent = round(gap_percent * 100, 1)
-                ai_advice = f"📉 等回檔 ({wait_percent}%)"
-                # 此時買點維持在 anchor_price，告訴使用者要等
-                final_buy_price = anchor_price
-                final_buy_note = f"乖離大，等{anchor_note}"
+        # 狀況 B: 整理/回檔股 (股價 < 月線)
         else:
-             ai_advice = "😐 暫不推薦"
-             final_buy_note = "評分不足"
+            if current_price > ma60:
+                # 雖然破月線，但還在季線之上 (中期多頭)
+                buy_suggestion = ma60
+                buy_note = "季線防守(MA60)"
+            else:
+                # 連季線都破了 (弱勢/超跌) -> 避免接刀，只抓短線反彈
+                # 設定一個「技術性反彈點」，例如現價打 95 折
+                buy_suggestion = current_price * 0.95 
+                buy_note = "超跌緩衝(-5%)"
+                
+                # 如果合理價(Fair Value)就在現價附近(且不低得太離譜)，則以合理價為準
+                if not np.isnan(fair_value):
+                    # 邏輯：合理價低於現價，但高於現價的85% (太低就沒意義了)
+                    if (current_price * 0.85) < fair_value < current_price:
+                        buy_suggestion = fair_value
+                        buy_note = "價值浮現(合理價)"
 
         # 篩選門檻
         if score >= 50:
             return {
-                "代號": ticker_symbol.replace(".TW", "").replace(".TWO", ""), 
+                "代號": ticker_symbol.replace(".TW", "").replace(".TWO", ""), # 簡化代號顯示
                 "名稱": name_map.get(ticker_symbol, ticker_symbol),
                 "現價": float(current_price),
-                "AI決策": ai_advice, 
-                "AI綜合評分": round(score, 1), 
-                "建議買點": float(round(final_buy_price, 2)), # 修正後的同步買點
-                "買點說明": final_buy_note, # 修正後的同步說明
+                "AI綜合評分": round(score, 1), # 改名為 AI 綜合評分
+                "建議買點": float(round(buy_suggestion, 2)), # 取小數點兩位
+                "買點說明": buy_note,
                 "合理價": fair_value if not np.isnan(fair_value) else None,
                 "波動率": volatility,
                 "CGO指標": round(cgo_val * 100, 1),
@@ -279,12 +258,12 @@ def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
 
 # --- Streamlit 介面 ---
 
-st.set_page_config(page_title="Miniko 投資戰情室 V9.4", layout="wide")
+st.set_page_config(page_title="Miniko 投資戰情室 V9.2", layout="wide")
 
-st.title("📊 Miniko & 曜鼎豐 - 投資戰情室 V9.4 (AI決策同步版)")
+st.title("📊 Miniko & 曜鼎豐 - 投資戰情室 V9.2 (實戰買點優化版)")
 st.markdown("""
 本系統整合 **CAPM、Fama-French 三因子、Gordon 模型** 與 **Smart Beta (CGO+低波動)** 策略。
-**【V9.4 更新】** 優化決策邏輯，確保 **「AI 決策」與「建議買點」同步**，消除操作落差感。
+**【V9.2 更新】** 強化「建議買點」邏輯，依據乖離率與均線動態調整，確保買點具備實戰成交可能性。
 """)
 
 # --- 知識庫 Expander (更新內容) ---
@@ -463,13 +442,12 @@ with col2:
             df_top100,
             use_container_width=True,
             hide_index=True,
-            column_order=["代號", "名稱", "現價", "AI決策", "AI綜合評分", "建議買點", "買點說明", "合理價", "策略標籤", "CGO指標", "波動率", "亮點"],
+            column_order=["代號", "名稱", "現價", "AI綜合評分", "建議買點", "買點說明", "合理價", "策略標籤", "CGO指標", "波動率", "亮點"],
             column_config={
                 "代號": st.column_config.TextColumn(help="股票代碼"),
                 "現價": st.column_config.NumberColumn(format="$%.2f"),
-                "AI決策": st.column_config.TextColumn(help="AI根據評分與乖離率給出的即時操作建議"),
                 "AI綜合評分": st.column_config.ProgressColumn(format="%.1f", min_value=0, max_value=100, help="綜合基本面與技術面的AI評分"),
-                "建議買點": st.column_config.NumberColumn(format="$%.2f", help="與決策同步：建議買進時為現價；觀望時為支撐價"),
+                "建議買點": st.column_config.NumberColumn(format="$%.2f", help="根據位階(MA5/10/20/60)計算的實戰掛單點"),
                 "合理價": st.column_config.NumberColumn(format="$%.2f", help="Gordon Model 計算之合理股價"),
                 "CGO指標": st.column_config.NumberColumn(format="%.1f%%", help="正值代表多數人獲利(支撐強)"),
                 "波動率": st.column_config.NumberColumn(format="%.2f", help="越低代表籌碼越穩定"),
