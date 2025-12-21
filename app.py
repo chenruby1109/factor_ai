@@ -219,6 +219,10 @@ def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
                 buy_suggestion = target
                 buy_note = "月線乖離買點"
         
+        # 
+
+[Image of Bollinger Bands strategy]
+ 
         # 最終防呆：若建議買點 >= 現價 (例如剛跌破均線)，強制設為現價向下 1.5%~2%
         # 確保使用者是「掛單等待」而非「市價追高」
         if buy_suggestion >= current_price:
