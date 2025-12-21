@@ -10,12 +10,13 @@ import twstock
 TELEGRAM_BOT_TOKEN = '您的_BOT_TOKEN' 
 TELEGRAM_CHAT_ID = '您的_CHAT_ID'
 
-# --- 全局參數 (調整為現貨思維) ---
-RF = 0.015  # 無風險利率 (Risk-Free Rate, 如定存)
+# --- 全局參數 (現貨思維 / 資金成本參數) ---
+RF = 0.015  # 無風險利率 (Risk-Free Rate, 如定存 1.5%)
 MRP = 0.055 # 市場風險溢酬 (Market Risk Premium)
-G_GROWTH = 0.02 # 股利長期成長率
+G_GROWTH = 0.02 # 股利長期成長率 (Gordon Model用)
+WACC_THRESHOLD = 0.05 # 假設公司資金成本門檻 (用於比較)
 
-# --- 核心功能函數 (完全保留原有邏輯) ---
+# --- 核心功能函數 ---
 
 def send_telegram_message(message):
     if TELEGRAM_BOT_TOKEN == '您的_BOT_TOKEN': return
@@ -26,7 +27,7 @@ def send_telegram_message(message):
 
 @st.cache_data(ttl=3600) 
 def get_market_data():
-    """下載大盤指數 (TWII)"""
+    """下載大盤指數 (TWII) 用於計算 Beta 與系統性風險"""
     try:
         market = yf.download("^TWII", period="1y", interval="1d", progress=False)
         if isinstance(market.columns, pd.MultiIndex):
@@ -53,9 +54,8 @@ def get_all_tw_tickers():
         return [], {}
 
 def get_realtime_price_robust(stock_code):
-    """【V8.3 價格修復版】(History + Realtime 雙重驗證)"""
+    """【V8.3 價格修復版】"""
     price = None
-    # 策略 1: yfinance History
     try:
         ticker = yf.Ticker(stock_code)
         hist = ticker.history(period="5d")
@@ -63,7 +63,6 @@ def get_realtime_price_robust(stock_code):
             price = float(hist['Close'].iloc[-1])
     except: pass
 
-    # 策略 2: twstock Realtime
     if price is None:
         try:
             code = stock_code.split('.')[0]
@@ -81,21 +80,24 @@ def get_realtime_price_robust(stock_code):
 
 def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
     """
-    【Miniko V9.1 旗艦運算核心 - 現貨版】
-    整合 CAPM, Fama-French, CGO, Smart Beta
+    【Miniko V9.2 旗艦運算核心 - 深度理論版】
+    包含：CAPM, Fama-French, CGO, Smart Beta, Gordon Model
+    產出：AI 綜合詳評 (替代單一買點)
     """
     try:
+        stock_name = name_map.get(ticker_symbol, ticker_symbol)
         current_price = get_realtime_price_robust(ticker_symbol)
         if current_price is None or current_price <= 0: return None
 
+        # 抓取 1 年數據
         data = yf.download(ticker_symbol, period="1y", interval="1d", progress=False)
         if len(data) < 100: return None 
         if isinstance(data.columns, pd.MultiIndex):
             data.columns = data.columns.get_level_values(0)
         
-        if current_price < 10: return None 
+        if current_price < 10: return None # 排除極低價股
 
-        # --- 1. CAPM ---
+        # --- 1. CAPM & WACC (資金成本分析) ---
         stock_returns = data['Close'].pct_change().dropna()
         aligned = pd.concat([stock_returns, market_returns], axis=1, join='inner').dropna()
         aligned.columns = ['Stock', 'Market']
@@ -106,9 +108,10 @@ def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
         mkt_var = aligned['Market'].var()
         beta = cov / mkt_var if mkt_var != 0 else 1.0
         
+        # Ke = Rf + Beta * MRP (權益資金成本 / 投資人要求報酬率)
         ke = RF + beta * MRP
         
-        # --- 2. Gordon Model ---
+        # --- 2. Gordon Model (股利折現評價) ---
         ticker_info = yf.Ticker(ticker_symbol).info
         div_rate = ticker_info.get('dividendRate', 0)
         if not div_rate:
@@ -120,339 +123,219 @@ def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
         if div_rate and div_rate > 0:
             fair_value = round(div_rate / k_minus_g, 2)
 
-        # --- 3. Fama-French Logic ---
+        # --- 3. Fama-French Proxy & Smart Beta ---
+        # SMB (規模)
         market_cap = ticker_info.get('marketCap', 0)
-        is_small_cap = market_cap > 0 and market_cap < 50000000000 
+        is_small_cap = 0 < market_cap < 50000000000 
         
+        # HML (價值)
         pb = ticker_info.get('priceToBook', 0)
-        is_value_stock = pb > 0 and pb < 1.5
+        is_value_stock = 0 < pb < 1.5
         
-        # --- 4. Smart Beta: CGO + Low Vol ---
+        # CGO (未實現獲利 - 籌碼面)
         ma100 = data['Close'].rolling(100).mean().iloc[-1]
-        cgo_val = (current_price - ma100) / ma100
+        cgo_val = (current_price - ma100) / ma100 # >0 代表多數人獲利
         
+        # Low Vol (低波動)
         volatility = stock_returns.std() * (252**0.5)
         
-        strategy_tags = []
-        if cgo_val > 0.1 and volatility < 0.3:
-            strategy_tags.append("🔥CGO低波優選")
-        
-        # --- 5. AI Score ---
+        # --- 4. AI 評分機制 ---
         score = 0.0
         factors = []
         
+        # 價值因子
         if is_value_stock:
             score += 15
-            factors.append("💎價值型(低PB)")
+            factors.append("價值型(低PB)")
         if not np.isnan(fair_value) and fair_value > current_price:
             score += 20
-            factors.append("💰低於Gordon合理價")
+            factors.append("低估(低於Gordon價)")
             
+        # 規模與動能
         if is_small_cap:
             score += 10
-            factors.append("🐟中小型股")
-            
-        rev_growth = ticker_info.get('revenueGrowth', 0)
-        if rev_growth > 0.2:
-            score += 15
-            factors.append("📈高成長")
-            
+            factors.append("中小型(SMB效應)")
+        
         ma20 = data['Close'].rolling(20).mean().iloc[-1]
-        if current_price > ma20:
-            score += 10
-        else:
-            score -= 5 
+        if current_price > ma20: score += 10 # 多頭排列
 
+        # 品質 (ROE)
         roe = ticker_info.get('returnOnEquity', 0)
         if roe > 0.15:
             score += 15
-            factors.append("👑高ROE")
-            
+            factors.append("高ROE")
+
+        # 風險 (Low Vol & CGO)
         if volatility < 0.25:
             score += 15
-            factors.append("🛡️低波動")
-        elif volatility > 0.5:
-            score -= 10
-            
-        # --- 6. Buy Suggestion ---
-        buy_suggestion = ma20 
-        buy_note = "MA20支撐"
+            factors.append("低波動(籌碼穩)")
+        if cgo_val > 0.1:
+            score += 10
+            factors.append("CGO高(賣壓輕)")
+
+        # --- 5. 生成 AI 綜合詳細建議 (取代單一買點) ---
+        # 這裡運用 WACC 與 CAPM 邏輯進行敘述
         
-        if not np.isnan(fair_value) and fair_value < ma20:
-            buy_suggestion = fair_value
-            buy_note = "合理價支撐"
+        advice_text = f"【{stock_name} AI深度解析】\n"
+        
+        # 資金成本觀點
+        advice_text += f"1. 資金成本與評價：Beta值為 {beta:.2f} ({( '高波動' if beta>1 else '低波動' )})。根據CAPM模型，您的要求報酬率(Ke)應為 {ke:.1%}。"
+        if not np.isnan(fair_value):
+            discount = (fair_value - current_price) / current_price
+            if discount > 0:
+                advice_text += f" Gordon模型顯示合理價約 {fair_value} 元，目前具 {discount:.1%} 潛在漲幅。"
+            else:
+                advice_text += f" Gordon模型顯示合理價約 {fair_value} 元，目前價格略高於理論價。"
+        else:
+            advice_text += " 無配息資料，不適用Gordon模型評價。"
+            
+        # 籌碼與策略觀點
+        advice_text += f"\n2. Smart Beta 檢測："
+        if cgo_val > 0.1 and volatility < 0.3:
+            advice_text += f"符合「CGO+低波動」策略。CGO指標 {cgo_val:.1%} 顯示多數籌碼獲利，且波動率 {volatility:.1%} 低，籌碼安定度高。"
+        else:
+            advice_text += f"波動率 {volatility:.1%}，CGO指標 {cgo_val:.1%}。雖未完全符合低波策略，但可關注其他因子。"
+            
+        # 投資決策建議 (不融資/不舉債)
+        advice_text += f"\n3. 投資決策 (現股無槓桿)："
+        if score >= 70:
+            advice_text += "綜合評分極優。符合Fama-French多因子特徵，建議以現有資金分批佈局，長期持有。"
+        elif score >= 50:
+            advice_text += "評分中上。若股價回測月線(MA20)不破，可視為現貨買點。"
+        else:
+            advice_text += "評分普通，建議先觀察，待籌碼面轉佳再介入。"
 
         if score >= 50:
             return {
                 "代號": ticker_symbol.replace(".TW", "").replace(".TWO", ""),
-                "名稱": name_map.get(ticker_symbol, ticker_symbol),
+                "名稱": stock_name,
                 "現價": float(current_price),
                 "AI綜合評分": round(score, 1),
-                "建議買點": float(buy_suggestion),
-                "買點說明": buy_note,
+                "AI綜合建議": advice_text, # 新欄位
                 "合理價": fair_value if not np.isnan(fair_value) else None,
-                "波動率": volatility,
+                "權益成本(Ke)": round(ke, 3),
                 "CGO指標": round(cgo_val * 100, 1),
-                "策略標籤": " ".join(strategy_tags),
+                "波動率": round(volatility, 2),
                 "亮點": " | ".join(factors)
             }
     except:
         return None
     return None
 
-# --- Streamlit 介面與新增內容 ---
+# --- Streamlit 介面 ---
 
-st.set_page_config(page_title="Miniko 投資戰情室 V9.2 Plus", layout="wide")
+st.set_page_config(page_title="Miniko 投資戰情室 V9.2", layout="wide")
 
-# Sidebar: 外部連結與計算機
-with st.sidebar:
-    st.image("https://cdn-icons-png.flaticon.com/512/3310/3310624.png", width=100)
-    st.title("Miniko 戰情室工具箱")
+st.title("📊 Miniko & 曜鼎豐 - 投資戰情室 V9.2 (三因子/APT/CAPM 深度版)")
+st.markdown("""
+本系統整合 **CAPM、APT、Fama-French 三因子** 與 **Smart Beta** 理論。
+**策略原則：** 嚴守 **不融資、不舉債、只買現股**，利用 WACC 概念評估企業價值，並結合嗨投資(HiStock)與TEJ資料庫邏輯。
+""")
+
+# --- 知識庫 Expander (深度理論整合) ---
+with st.expander("📚 點此查看：Miniko 專屬三因子資料庫與投資理論 (MPT/APT/CAPM)"):
+    tab_theory, tab_chips, tab_backtest, tab_factors = st.tabs(["核心理論 (CAPM/APT/FF3)", "籌碼面六大指標", "CGO策略回測", "八大因子與Smart Beta"])
     
-    st.markdown("### 🔗 外部資源")
-    st.link_button("前往 嗨投資 (HiStock)", "https://histock.tw/")
-    
-    st.markdown("---")
-    st.markdown("### 🧮 財務決策模擬")
-    st.info("假設公司資金成本(WACC) = 5%")
-    
-    # NPV 計算機 (依照您的範例)
-    st.markdown("**NPV 案例試算**")
-    wacc_input = st.number_input("資金成本率 (%)", value=5.0, step=0.1) / 100
-    
-    # 方案 A
-    cf_a = [1000, 1000, 1000, 1000]
-    npv_a = sum([cf / ((1+wacc_input)**(i+1)) for i, cf in enumerate(cf_a)])
-    
-    # 方案 B
-    cf_b = [1000, 500, 1500, 1000]
-    npv_b = sum([cf / ((1+wacc_input)**(i+1)) for i, cf in enumerate(cf_b)])
-    
-    st.write(f"🅰️ 方案A NPV: **{npv_a:.2f}**")
-    st.write(f"🅱️ 方案B NPV: **{npv_b:.2f}**")
-    
-    if npv_a > npv_b:
-        st.success("建議選擇：方案 A")
-    else:
-        st.success("建議選擇：方案 B")
+    with tab_theory:
+        st.markdown("""
+        ### 一、投資組合理論 (MPT) 與 CAPM
+        * **MPT (現代投資組合理論)**：由 Markowitz 提出，核心觀念是「多角化降低風險」。
+            * 公式：$\sigma_p = \sqrt{\sum w_i^2 \sigma_i^2 + \sum \sum w_i w_j \sigma_i \sigma_j \rho_{ij}}$
+            * 意義：船運公司案例，10艘小船風險遠低於2艘大船。
         
-    st.markdown("---")
-    st.markdown("**融資決策判斷**")
-    st.text("銀行借款利率: 4%")
-    st.text("預期投資報酬率: 6%")
-    st.caption("決策：應傾向舉債(Leverage)而非增資，因為借款成本(4%) < 報酬(6%)。")
-
-st.title("📊 Miniko & 曜鼎豐 - 投資戰情室 V9.2 Plus")
-st.markdown("### 整合 CAPM、Fama-French、CGO 與 籌碼面分析的 AI 決策系統")
-
-# --- 新增：Miniko 投資學院 (教學與理論區) ---
-with st.expander("📚 點此進入：Miniko 投資學院 (理論、籌碼、策略)", expanded=False):
-    
-    course_tab1, course_tab2, course_tab3, course_tab4 = st.tabs([
-        "💰 金融理論與定價模型", 
-        "🕵️ 籌碼面六大指標", 
-        "📈 Fama-French 與八大因子", 
-        "🚀 CGO 與 Smart Beta 策略"
-    ])
-    
-    # --- TAB 1: 金融理論 ---
-    with course_tab1:
-        st.header("一、投資組合理論與定價模型")
-        
-        col_t1, col_t2 = st.columns(2)
-        with col_t1:
-            st.subheader("1. 投資組合理論 (MPT)")
-            st.markdown("""
-            **Markowitz (1950s) 多角化概念量化：**
-            * 核心概念：透過多角化投資，當資產數量(n)增加，非系統性風險($\sigma$)下降。
-            * 
-            * **案例：船運公司風險分散**
-                * **情境**：總運費200萬，貨物價值1000萬，出事機率0.1。
-                * **2艘大船**：風險(標準差) $\sigma = 260.22$
-                * **10艘小船**：風險(標準差) $\sigma = 116.62$
-                * **結論**：拆成多艘小船運輸（多角化），預期利潤相同，但風險顯著降低。
-            """)
-            
-            st.subheader("2. 資本資產定價模式 (CAPM)")
-            st.latex(r"E(R_i) = R_f + \beta \times (R_m - R_f)")
-            st.markdown("""
+        * **CAPM (資本資產定價模式)**：
+            * 公式：$E(R_i) = R_f + \\beta(R_m - R_f)$
             * $R_f$：無風險利率 (如定存)
             * $R_m - R_f$：市場風險溢酬 (MRP)
-            * $\beta$：系統性風險係數
-            * **應用**：計算 **Ke (權益資金成本)**，作為投資人要求的最低回報率。
-            * **批評**：假設市場完美、投資人理性，且無法解釋「規模效應」或「價值效應」。
-            """)
-            st.write("")
-
-        with col_t2:
-            st.subheader("3. 套利定價模式 (APT)")
-            st.markdown("""
-            **Ross (1976)** 提出。主張個股報酬受「多個」系統因子影響，而非僅有市場風險。
-            * 公式：$E(R_i) = \beta_0 + \Sigma \beta_i \times F_i$
-            * 因子包含：通膨、利差、工業生產指數等。
-            * **特點**：利用套利行為達成市場均衡。
-            """)
+            * **應用**：計算 **Ke (權益資金成本)**，作為投資人的要求報酬率。
             
-            st.subheader("4. 評價模型：Gordon Model")
-            st.latex(r"P = \frac{Div}{K - g}")
-            st.markdown("""
-            * **應用**：股利折現模型，計算合理股價。
-            * **範例**：
-                * 每年發放股利 3 元
-                * 預期報酬率 (K) 6%
-                * 合理股價 = $3 / 0.06 = 50$ 元。
-            """)
-
-    # --- TAB 2: 籌碼面 ---
-    with course_tab2:
-        st.header("二、籌碼面分析：判斷大戶動向")
-        st.markdown("可以用這 **6項指標** 來看這一檔股票是否是「籌碼集中股」！")
-        
-        st.info("前三個是「絕對指標」 (判斷是否已被大戶擁抱)")
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            st.markdown("#### 1. 千張大戶持股")
-            st.markdown("""
-            * **< 40%**：籌碼不集中。
-            * **> 80%**：過於集中，股價難有波動。
-            * **40% ~ 70%**：**最佳交易區間**。
-            * 人數越少，越有炒作優勢。
-            """)
-        with c2:
-            st.markdown("#### 2. 內部人持股")
-            st.markdown("""
-            * **> 40%**：算高。
-            * 代表老闆與股東利益一致。
-            * 不易暴漲暴跌，適合長期持有，隨公司獲利成長。
-            """)
-        with c3:
-            st.markdown("#### 3. 佔股本比重")
-            st.markdown("""
-            * **定義**：區間買賣超佔股本比重。
-            * **訊號**：60天內買賣超佔股本 **> 3%**。
-            * 代表有主力大戶介入 (較適用於大型股)。
-            """)
+        * **APT (套利定價模式)**：
+            * Ross (1976) 提出，認為股價受多個系統因子影響 (通膨、利差等)。
+            * $E(R_i) = \\beta_0 + \Sigma \\beta_i F_i$
             
-        st.info("後三個是「相對指標」 (發現明日之星)")
-        c4, c5, c6 = st.columns(3)
-        with c4:
-            st.markdown("#### 4. 籌碼集中度")
-            st.markdown("""
-            * 60天集中度：**> 5%** 為佳。
-            * 120天集中度：**> 3%** 為佳。
-            * 單日集中度：**> 20%** 可能有特定人收集。
-            """)
-        with c5:
-            st.markdown("#### 5. 主力買賣超")
-            st.markdown("""
-            * **正常**：主力買、股價漲。
-            * **警訊**：主力賣、股價漲 (可能是主力倒貨給散戶，自己左手賣右手炒高)。
-            * 需搭配「買賣家數差」一起看。
-            """)
-        with c6:
-            st.markdown("#### 6. 買賣家數差")
-            st.markdown("""
-            * **負數 (賣家 > 買家)**：代表**籌碼集中** (多數散戶賣給少數大戶)。
-            * **必勝訊號**：
-                1. 主力買超 (+)
-                2. 買賣家數差 (-) 
-                3. **大戶正在吸籌！**
-            """)
-
-    # --- TAB 3: Fama-French ---
-    with course_tab3:
-        st.header("三、Fama-French 三因子與多因子模型")
-        st.markdown("")
-        st.markdown("""
-        **Fama & French (1992)** 發現 $\\beta$ 對報酬解釋力不足，因此加入規模與價值因子：
-        $$E(R_i) = R_f + \beta_1(MRP) + \beta_2(SMB) + \beta_3(HML)$$
-        """)
-        
-        st.subheader("三大核心因子")
-        st.markdown("""
-        1.  **市場風險 (MRP)**：$R_m - R_f$。
-        2.  **規模溢酬 (SMB - Small Minus Big)**：長期來看，**小型股**報酬率高於大型股。
-        3.  **價值溢酬 (HML - High Minus Low)**：**高淨值市價比 (Value)** 股票報酬優於成長股。
-        """)
-        
-        st.subheader("TEJ 八大因子體系")
-        st.table(pd.DataFrame({
-            "因子名稱": ["市場風險", "規模", "淨值市價比", "益本比", "現金股利率", "動能", "短期反轉", "長期反轉"],
-            "投資邏輯": [
-                "承擔市場波動的補償",
-                "小型股具爆發力 (SMB)",
-                "價值型投資 (HML)",
-                "高益本比 (便宜) 優於低益本比",
-                "高殖利率保護",
-                "強者恆強 (近1年表現好)",
-                "跌深反彈 (近1月表現差)",
-                "長期回歸均值 (近3-4年表現差)"
-            ]
-        }))
-        
-        st.subheader("台灣市場實證結論 (1995-2009)")
-        st.success("""
-        * **價值型投資有效**：以「益本比」及「現金股利」區分效果最佳。
-        * **小型價值股最強**：過去曾創造近 3 倍報酬 (年化約 10%)。
-        * **反轉效應**：台灣市場在短期與長期皆有「反應過度」現象 (適合反向操作)。
-        """)
-
-    # --- TAB 4: Smart Beta & CGO ---
-    with course_tab4:
-        st.header("四、Smart Beta 與 CGO 策略")
-        st.markdown("""
-        **Smart Beta** 是介於主動與被動之間的策略，透過選取特定因子 (Factor) 來獲取超額報酬 (Alpha)。
-        """)
-        
-        col_sb1, col_sb2 = st.columns(2)
-        with col_sb1:
-            st.subheader("CGO (Capital Gains Overhang)")
-            st.markdown("""
-            * **定義**：未實現資本利得。
-            * **公式概念**：$(現價 - 參考成本) / 參考成本$。
-            * **行為財務學意義**：
-                * 當 CGO 高 (大家都在賺錢)：投資人惜售，賣壓小，支撐強。
-                * 當 CGO 低 (大家都在賠錢)：解套賣壓重。
-            """)
-        with col_sb2:
-            st.subheader("低波動 (Low Volatility)")
-            st.markdown("""
-            * **現象**：長期而言，低波動股票的「風險調整後報酬」優於高波動股票。
-            * **原因**：避免大幅回撤 (Max Drawdown)，複利效果更佳。
-            """)
+        * **Fama & French 三因子 (FF3)**：
+            * 修正 CAPM 對 Beta 解釋力不足的問題。
+            * 加入 **SMB (規模溢酬)**：小型股報酬通常高於大型股。
+            * 加入 **HML (淨值市價比溢酬)**：價值股通常優於成長股。
+            * 公式：$E(R_i) = \\beta_0 + \\beta_1 MRP + \\beta_2 SMB + \\beta_3 HML$
             
-        st.markdown("---")
-        st.subheader("🏆 Miniko 推薦策略：CGO + Low Vol (序貫排序法)")
-        st.markdown("""
-        **策略邏輯 (cgo_low_tv)：**
-        1.  **第一步 (Filter)**：先篩選全市場 **歷史波動度最低** 的 10% 股票 (剔除高風險雜訊)。
-        2.  **第二步 (Select)**：在低波動池中，買入 **CGO 值最高** (籌碼最穩定、獲利中) 的 50 檔。
-        
-        **回測績效 (2005-2025/06)：**
-        * **年化報酬率**：14.04% (優於大盤 10.74%)
-        * **波動率**：降至 8.46% (大盤為 18.38%)
-        * **夏普比率 (Sharpe Ratio)**：**1.596** (顯著優於純 CGO 的 0.927)
-        * **結論**：低波動篩選能有效「提純」CGO 因子的獲利能力，降低 Beta，提升 Alpha。
+        ### 💡 投資與融資決策 (WACC)
+        * **投資決策**：計算 WACC (加權平均資金成本)，將未來現金流折現算出 NPV。若 NPV > 0 (或報酬率 > WACC)，則投資可行。
+            * *Miniko 案例*：假設公司 WACC=5%。
+        * **融資決策**：比較舉債與增資成本。
+            * 若銀行借款 4% < 預期報酬 6%，傾向舉債 (但本策略設定為**不舉債**，全採現股)。
+        * **Gordon Model 評價**：$P = Div / (Ke - g)$。
         """)
-        st.line_chart(pd.DataFrame({'Strategy': [100, 114, 130, 145, 1281], 'Market': [100, 110, 120, 115, 668]}, index=[2005, 2010, 2015, 2020, 2025]))
-        st.caption("示意圖：策略累積報酬率 vs 大盤 (參考數據)")
 
-# --- 主程式區 (保留原有掃描邏輯) ---
+    with tab_chips:
+        st.markdown("""
+        ### 🕵️ 籌碼面六大指標 (判斷大戶與散戶)
+        1.  **千張大戶持股**：
+            * 絕對指標。適合區間 **40% ~ 70%**。>80% 則波動過小。
+        2.  **內部人持股**：
+            * >40% 代表經營層利益與股東一致，適合長期持有。
+        3.  **佔股本比重 (區間買賣超)**：
+            * 若 60 天內買賣超佔股本 > 3%，代表主力介入 (較適用大型股)。
+        4.  **籌碼集中度**：
+            * 60天集中度 > 5%、120天集中度 > 3% 為佳。
+        5.  **主力買賣超**：
+            * 若主力賣、股價漲 (背離)，小心主力倒貨。
+        6.  **買賣家數差 (重要必勝訊號)**：
+            * 負數 (賣家家數 > 買家家數) = **籌碼集中** (多數散戶賣給少數大戶)。
+            * **訊號**：主力買超 (+) 且 買賣家數差 (-) = 大戶吸籌中！
+        """)
+
+    with tab_backtest:
+        st.markdown("""
+        ### 🚀 CGO + 低波動 (Smart Beta 回測實證)
+        **資料來源：TEJ、嗨投資 (HiStock)、Miniko 數據庫** (2005-2025)
+        
+        * **策略定義**：
+            * **CGO (未實現資本利得)**：$(P - Cost) / Cost$。衡量潛在賣壓。
+            * **cgo_low_tv 策略**：先選「歷史波動度低 (TV100)」的股票，再從中選「CGO 高」的股票。
+            
+        * **回測績效 (2005-2025)**：
+            | 績效指標 | 純 CGO 策略 | **CGO + Low TV (推薦)** | 大盤基準 |
+            | :--- | :--- | :--- | :--- |
+            | 年化報酬 | 14.89% | **14.04%** | 10.74% |
+            | 年化波動 | 16.45% | **8.46% (超穩)** | 18.38% |
+            | 夏普比率 | 0.927 | **1.596 (優)** | 0.647 |
+            | 最大回撤 | -57% | **-32%** | -56% |
+            
+        * **結論**：
+            加入低波動因子後，雖然報酬率略降，但**風險大幅降低** (波動率減半)，夏普比率顯著提升。這符合我們「不融資、求穩健」的投資哲學。
+        """)
+        
+    with tab_factors:
+        st.markdown("""
+        ### 📊 TEJ 市場八大因子
+        根據 Fama-French 延伸，台股市場有效因子包含：
+        1.  **市場風險溢酬 (MRP)**
+        2.  **規模溢酬 (SMB)**：小型股效應 (台灣市場不明顯，但小型價值股強)。
+        3.  **淨值市價比 (HML)**：價值型投資在台灣長期有效。
+        4.  **益本比 (E/P)**：高益本比 (低本益比) 優於成長股。
+        5.  **現金股利率**：高股息長期優於低股息。
+        6.  **動能因子**：過去一年表現好，預期續強。
+        7.  **短期反轉**：近1個月表現差，預期反彈 (反應過度)。
+        8.  **長期反轉**：近3-4年表現差，預期長線反轉。
+        """)
+
+# --- 主程式區 ---
 if 'results' not in st.session_state:
     st.session_state['results'] = []
 
 col1, col2 = st.columns([1, 4])
 
 with col1:
-    st.info("💡 系統將執行 AI 綜合評估，篩選全市場最值得買入的現貨標的。")
-    if st.button("🚀 啟動 AI 智能掃描 (Top 100)", type="primary"):
-        with st.spinner("Step 1: 計算市場風險參數 (Beta/MRP)..."):
+    st.info("💡 系統執行：CAPM 計算 Ke、Gordon 評價、Fama-French 因子掃描。")
+    if st.button("🚀 啟動 AI 智能運算 (Top 100)", type="primary"):
+        with st.spinner("Step 1: 載入大盤數據與無風險利率..."):
             market_returns = get_market_data()
         
-        with st.spinner("Step 2: 載入股票清單..."):
+        with st.spinner("Step 2: 載入全市場清單 (含嗨投資/TEJ定義)..."):
             tickers, name_map = get_all_tw_tickers()
             
-        st.success(f"開始分析 {len(tickers)} 檔股票的財務因子...")
+        st.success(f"鎖定 {len(tickers)} 檔標的，開始 AI 深度運算...")
         st.session_state['results'] = []
         
         progress_bar = st.progress(0)
@@ -468,7 +351,7 @@ with col1:
                 completed += 1
                 if completed % 10 == 0:
                     progress_bar.progress(completed / len(tickers))
-                    status_text.text(f"AI 分析中: {completed}/{len(tickers)}")
+                    status_text.text(f"AI 解析中: {completed}/{len(tickers)}")
                 if data:
                     st.session_state['results'].append(data)
 
@@ -476,32 +359,29 @@ with col1:
 
 with col2:
     if not st.session_state['results']:
-        st.write("👈 點擊按鈕開始分析。")
+        st.write("👈 請點擊左側按鈕開始分析。")
+        [st.write("")] # Placeholder
     else:
         df = pd.DataFrame(st.session_state['results'])
         
-        # --- AI 篩選邏輯 ---
-        df['SortKey'] = df['策略標籤'].apply(lambda x: 100 if "CGO" in x else 0)
-        df['TotalScore'] = df['AI綜合評分'] + df['SortKey']
+        # 排序邏輯：評分優先 -> CGO優先
+        df = df.sort_values(by=['AI綜合評分', 'CGO指標'], ascending=[False, False]).head(100)
         
-        # 取前 100 名
-        df_top100 = df.sort_values(by=['TotalScore', 'AI綜合評分'], ascending=[False, False]).head(100)
-        
-        st.subheader(f"🏆 AI 推薦優先買入 Top 100 ({len(df_top100)} 檔)")
+        st.subheader(f"🏆 AI 嚴選現貨清單 Top 100 (不融資/不舉債)")
         
         st.dataframe(
-            df_top100,
+            df,
             use_container_width=True,
             hide_index=True,
-            column_order=["代號", "名稱", "現價", "AI綜合評分", "建議買點", "買點說明", "合理價", "策略標籤", "CGO指標", "波動率", "亮點"],
+            column_order=["代號", "名稱", "現價", "AI綜合評分", "AI綜合建議", "合理價", "權益成本(Ke)", "CGO指標", "波動率", "亮點"],
             column_config={
-                "代號": st.column_config.TextColumn(help="股票代碼"),
+                "代號": st.column_config.TextColumn(width="small"),
                 "現價": st.column_config.NumberColumn(format="$%.2f"),
-                "AI綜合評分": st.column_config.ProgressColumn(format="%.1f", min_value=0, max_value=100, help="綜合基本面與技術面的AI評分"),
-                "建議買點": st.column_config.NumberColumn(format="$%.2f", help="根據技術支撐(MA20)或合理價計算的建議掛單點"),
-                "合理價": st.column_config.NumberColumn(format="$%.2f", help="Gordon Model 計算之合理股價"),
-                "CGO指標": st.column_config.NumberColumn(format="%.1f%%", help="正值代表多數人獲利(支撐強)"),
-                "波動率": st.column_config.NumberColumn(format="%.2f", help="越低代表籌碼越穩定"),
+                "AI綜合評分": st.column_config.ProgressColumn(format="%.1f", min_value=0, max_value=100),
+                "AI綜合建議": st.column_config.TextColumn(width="large", help="包含WACC、CAPM、籌碼面之完整分析"),
+                "合理價": st.column_config.NumberColumn(format="$%.2f", help="Gordon Model"),
+                "權益成本(Ke)": st.column_config.NumberColumn(format="%.1f%%", help="CAPM計算之投資人要求報酬率"),
+                "CGO指標": st.column_config.NumberColumn(format="%.1f%%", help="正值代表籌碼獲利"),
                 "亮點": st.column_config.TextColumn(width="medium"),
             }
         )
