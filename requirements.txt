@@ -5,3 +5,4 @@ ta
 numpy
 requests
 lxml
+twstock
