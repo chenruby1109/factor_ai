@@ -230,4 +230,17 @@ with col1:
             top_3 = df_final.head(3)
             msg = f"🏹 **【Miniko 狙擊手報告】**\n發現 {len(df_final)} 檔潛力股，前三名：\n"
             for _, row in top_3.iterrows():
-                msg += f"• {row['Name']} ({row['Ticker']}) ${
+                msg += f"• {row['Name']} ({row['Ticker']}) ${row['Close']}\n"
+            send_telegram_message(msg)
+
+with col2:
+    if not st.session_state['results']:
+        st.write("👈 點擊左側按鈕開始，結果會即時顯示...")
+    else:
+        df_show = pd.DataFrame(st.session_state['results'])
+        st.subheader(f"🎯 歷史掃描結果 ({len(df_show)} 檔)")
+        st.dataframe(
+            df_show.sort_values(by='Score', ascending=False), 
+            use_container_width=True, 
+            hide_index=True
+        )
