@@ -80,205 +80,237 @@ def get_realtime_price_robust(stock_code):
 
 def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
     """
-    【Miniko V9.4 旗艦運算核心 - 價格意圖因子引擎】
-    特點：整合「價格意圖因子」(Return / Variability) 識別主力畫線股。
+    【Miniko V9.6 機構法人旗艦版 - 大戶多因子模型】
+    新增核心：
+    1. ROIC (投入資本回報率)：識破財務槓桿，尋找高效率公司。
+    2. FCF Yield (自由現金流收益率)：大戶的真實估值指標。
+    3. Earnings Quality (獲利品質)：檢視現金流與淨利的比例。
     """
     try:
         stock_name = name_map.get(ticker_symbol, ticker_symbol)
         current_price = get_realtime_price_robust(ticker_symbol)
         if current_price is None or current_price <= 0: return None
 
-        # 抓取 1 年數據 (足夠計算60天意圖因子)
+        # 基礎數據下載
         data = yf.download(ticker_symbol, period="1y", interval="1d", progress=False)
         if len(data) < 100: return None 
         if isinstance(data.columns, pd.MultiIndex):
             data.columns = data.columns.get_level_values(0)
         
-        if current_price < 10: return None # 排除極低價股
-
-        # --- 0. 核心選股：價格意圖因子 (Price Intent Factor) ---
-        # 邏輯：報酬率(s) / 變動率(v)。尋找 A->B 走直線的股票
+        # 取得詳細財務數據 (用於計算 ROIC, FCF 等)
+        # 注意：yfinance info 請求較慢，但在單線程或少量多線程下尚可接受
+        ticker = yf.Ticker(ticker_symbol)
+        info = ticker.info
+        
+        # --- 0. 基礎趨勢與意圖因子 ---
         days = 60
         close_series = data['Close']
         volume_series = data['Volume']
         
-        # S: 60天報酬率
+        # S: 60天報酬率 & V: 變動率
         price_60_ago = close_series.iloc[-days]
         s_return = (current_price / price_60_ago) - 1
-        
-        # V: 變動率 (每日漲跌幅絕對值總和)
         v_variability = close_series.pct_change().abs().tail(days).sum()
-        
-        # Volume Check (日均量)
         avg_volume = volume_series.tail(days).mean()
         
-        # 意圖因子計算
+        # 意圖因子計算 (保留您的原始邏輯)
         intent_factor = 0
         score_intent = 0
         is_intent_candidate = False
         
-        # 篩選條件：1. 收益率 < 20% (避免過熱) 2. 成交量 > 200,000 (流動性)
-        if v_variability > 0 and 0 < s_return < 0.20 and avg_volume > 200000:
-            # 原始因子: s / v
+        if v_variability > 0 and avg_volume > 1000:
             raw_intent = s_return / v_variability
-            # 排名指標: (s / v) / volume (偏好低關注度但走勢穩定的)
-            # 為了讓數值可讀，我們主要評估 raw_intent (直線性)，並確認 volume 不會過大
-            
-            intent_factor = raw_intent
-            is_intent_candidate = True
-            score_intent = 25 # 符合此核心邏輯直接加高分
+            if 0 < s_return < 0.25: 
+                intent_factor = raw_intent
+                is_intent_candidate = True
+                score_intent = 20 # 權重微調，讓位給基本面
+            elif s_return < -0.1:
+                score_intent = 5 
 
-        # --- 1. CAPM & WACC (資金成本分析) ---
+        # --- 1. 機構大戶深層數據 (Institutional Data) ---
+        
+        # A. ROIC 計算 (簡易估算版)
+        # NOPAT (稅後淨營業利潤) ≈ EBITDA * (1 - 稅率20%) 
+        # Invested Capital (投入資本) ≈ 總負債 + 股東權益 - 現金
+        ebitda = info.get('ebitda')
+        total_debt = info.get('totalDebt')
+        total_cash = info.get('totalCash')
+        equity = info.get('stockholdersEquity')
+        
+        roic = 0
+        if ebitda and total_debt and equity and total_cash:
+            invested_capital = total_debt + equity - total_cash
+            nopat = ebitda * 0.8 
+            if invested_capital > 0:
+                roic = nopat / invested_capital
+
+        # B. FCF Yield 計算 (真實估值)
+        fcf = info.get('freeCashflow')
+        mkt_cap = info.get('marketCap')
+        fcf_yield = 0
+        if fcf and mkt_cap and mkt_cap > 0:
+            fcf_yield = fcf / mkt_cap
+
+        # C. 獲利品質 (Quality of Income)
+        # 營業現金流 / 淨利 (若無淨利數據則忽略)
+        op_cash = info.get('operatingCashflow')
+        net_income = info.get('netIncomeToCommon')
+        earnings_quality = 0
+        if op_cash and net_income and net_income > 0:
+            earnings_quality = op_cash / net_income
+
+        # D. PEG 與 估值
+        peg_ratio = info.get('pegRatio', None)
+        pb = info.get('priceToBook', 0)
+
+        # --- 2. CAPM & WACC (風險控管) ---
         stock_returns = close_series.pct_change().dropna()
         aligned = pd.concat([stock_returns, market_returns], axis=1, join='inner').dropna()
         aligned.columns = ['Stock', 'Market']
         
-        if len(aligned) < 60: return None
-
-        cov = aligned.cov().iloc[0, 1]
-        mkt_var = aligned['Market'].var()
-        beta = cov / mkt_var if mkt_var != 0 else 1.0
+        if len(aligned) < 60: beta = 1.0
+        else:
+            cov = aligned.cov().iloc[0, 1]
+            mkt_var = aligned['Market'].var()
+            beta = cov / mkt_var if mkt_var != 0 else 1.0
         
-        # Ke = Rf + Beta * MRP (權益資金成本)
-        ke = RF + beta * MRP
+        ke = RF + beta * MRP # 權益資金成本
         
-        # --- 2. Gordon Model ---
-        ticker_info = yf.Ticker(ticker_symbol).info
-        div_rate = ticker_info.get('dividendRate', 0)
+        # Gordon 合理價 (作為參考)
+        div_rate = info.get('dividendRate', 0)
         if not div_rate:
-            yield_val = ticker_info.get('dividendYield', 0)
+            yield_val = info.get('dividendYield', 0)
             if yield_val: div_rate = current_price * yield_val
-
+        
         fair_value = np.nan
         k_minus_g = max(ke - G_GROWTH, 0.015) 
         if div_rate and div_rate > 0:
             fair_value = round(div_rate / k_minus_g, 2)
 
-        # --- 3. Smart Beta (CGO & Low Vol) ---
-        pb = ticker_info.get('priceToBook', 0)
-        ma100 = close_series.rolling(100).mean().iloc[-1]
-        cgo_val = (current_price - ma100) / ma100 
-        volatility = stock_returns.std() * (252**0.5)
-        
-        # --- 4. AI 差異化評分機制 ---
-        score = score_intent # 初始分數由意圖因子決定
+        # --- 3. 大戶多因子評分系統 (Scoring) ---
+        score = score_intent # 初始分 (0-20)
         factors = []
         
-        if is_intent_candidate:
-            factors.append("💎價格意圖優選(直線爬升)")
+        if is_intent_candidate: factors.append("💎主力畫線")
 
-        # 價值因子
-        if 0 < pb < 1.0:
+        # [新增] 資本效率因子 (ROIC) - 大戶最愛
+        # ROIC > 15% 代表極佳護城河 (如台積電)
+        if roic > 0.15:
             score += 20
-            factors.append("深度價值(PB<1)")
-        elif 1.0 <= pb < 1.5:
+            factors.append(f"高資本效率(ROIC {roic:.1%})")
+        elif roic > 0.10:
             score += 10
+            factors.append("ROIC優")
+
+        # [新增] 現金流因子 (FCF Yield) - 價值防禦
+        # FCF Yield > 4% 代表即使不成長，現金回報也很可觀
+        if fcf_yield > 0.05:
+            score += 20
+            factors.append(f"現金牛(FCF殖利率{fcf_yield:.1%})")
+        elif fcf_yield > 0.03:
+            score += 10
+
+        # [新增] 獲利品質 (Earnings Quality) - 避雷針
+        # 現金流比淨利大，代表賺的是真錢
+        if earnings_quality > 1.2:
+            score += 10
+            factors.append("獲利含金量高")
+        elif earnings_quality < 0.5 and net_income > 0:
+            score -= 10 # 扣分：賺的錢都是應收帳款(虛的)
+
+        # 成長估值 (PEG)
+        if peg_ratio and 0 < peg_ratio < 1.0:
+            score += 15
+            factors.append("PEG低估(成長>估值)")
+
+        # 傳統價值 (PB)
+        if 0 < pb < 1.2: 
+            score += 10
+            factors.append("低PB")
+
+        # 波動率 (Smart Beta)
+        volatility = stock_returns.std() * (252**0.5)
+        if volatility < 0.30:
+            score += 10
+            if volatility < 0.25: factors.append("籌碼安定")
             
-        if not np.isnan(fair_value):
-            upside = (fair_value - current_price) / current_price
-            if upside > 0.2:
-                score += 15
-                factors.append("估值低估")
-
-        # 品質 (ROE)
-        roe = ticker_info.get('returnOnEquity', 0)
-        if roe > 0.15:
-            score += 10
-            factors.append("高ROE")
-
-        # 技術與籌碼
+        # 技術面 (站上月線)
         ma20 = close_series.rolling(20).mean().iloc[-1]
         if current_price > ma20: score += 5
-
-        if volatility < 0.25:
-            score += 15
-            factors.append("籌碼安定")
-            
-        if cgo_val > 0.1:
-            score += 10
-
-        # --- 5. 生成「個別化」AI 深度綜合建議 ---
         
-        # 路徑軌跡診斷 (New!)
-        path_diagnosis = ""
-        if is_intent_candidate:
-            path_diagnosis = f"【極佳】股價呈「直線爬升」型態。意圖因子顯示主力控盤穩定，且近60日漲幅 {s_return:.1%} 未過熱，屬於穩定推升階段。"
-        elif s_return > 0.3:
-            path_diagnosis = f"【過熱注意】近60日漲幅達 {s_return:.1%}，雖強勢但偏離直線軌跡，需提防回調。"
-        elif v_variability > 0.5:
-            path_diagnosis = "【震盪劇烈】路徑曲折，多空拉鋸明顯，缺乏明確主力控盤方向。"
-        else:
-            path_diagnosis = "股價路徑一般，隨市場波動。"
+        # CGO (籌碼獲利)
+        ma100 = close_series.rolling(100).mean().iloc[-1]
+        cgo_val = (current_price - ma100) / ma100
+        if cgo_val > 0.05: score += 5
 
-        # 價值與風險
-        valuation_txt = f"合理價 {fair_value}" if not np.isnan(fair_value) else "無股利評價"
-        risk_txt = f"Beta {beta:.2f} (防禦型)" if beta < 1 else f"Beta {beta:.2f} (波動型)"
-
-        # 綜合結論
-        action_plan = ""
-        if score >= 75:
-            action_plan = "評分極高。具備「價格意圖」與「基本面」雙重優勢，建議積極佈局。"
-        elif score >= 50:
-            action_plan = "評分中上。路徑或價值面有一項優勢，可納入觀察。"
+        # --- 4. 生成大戶視角診斷 ---
+        
+        # 診斷文字
+        inst_view = ""
+        if roic > ke:
+            inst_view += "✅ **價值創造**：ROIC > 資金成本(Ke)，公司正在為股東創造真實價值。"
         else:
-            action_plan = "觀望。缺乏明確上漲意圖或籌碼優勢。"
+            inst_view += "⚠️ **價值毀滅**：ROIC < 資金成本(Ke)，需留意資本使用效率。"
+            
+        if fcf_yield > 0.04:
+            inst_view += f" 現金流強勁 (FCF Yield {fcf_yield:.1%})，下檔具支撐。"
+        elif fcf < 0:
+            inst_view += " 自由現金流為負，留意燒錢狀況。"
+
+        path_diagnosis = f"趨勢向上 ({s_return:.1%})" if s_return > 0 else f"趨勢修正 ({s_return:.1%})"
 
         final_advice = (
-            f"🎯 **AI 核心解析**：\n"
-            f"1. **軌跡**：{path_diagnosis}\n"
-            f"2. **價值**：{valuation_txt}，{risk_txt}。\n"
-            f"3. **籌碼**：CGO {cgo_val:.1%} ({( '獲利惜售' if cgo_val>0.1 else '正常' )})。\n"
-            f"4. **決策**：{action_plan}"
+            f"📊 **大戶因子解析**：\n"
+            f"1. **品質**：ROIC {roic:.1%} | {inst_view}\n"
+            f"2. **估值**：FCF Yield {fcf_yield:.1%} | PEG {peg_ratio if peg_ratio else 'N/A'}\n"
+            f"3. **技術**：{path_diagnosis} | Beta {beta:.2f}"
         )
 
-        if score >= 50:
+        # 回傳門檻
+        if score >= 30: 
             return {
                 "代號": ticker_symbol.replace(".TW", "").replace(".TWO", ""),
                 "名稱": stock_name,
                 "現價": float(current_price),
                 "AI綜合評分": round(score, 1),
                 "AI綜合建議": final_advice,
-                "意圖因子": round(intent_factor, 2) if is_intent_candidate else 0, # 新欄位
-                "權益成本(Ke)": round(ke, 3),
-                "CGO指標": round(cgo_val * 100, 1),
-                "波動率": round(volatility, 2),
+                "ROIC": f"{roic:.1%}", # 新增顯示
+                "FCF Yield": f"{fcf_yield:.1%}", # 新增顯示
+                "合理價": fair_value if not np.isnan(fair_value) else 0,
                 "亮點": " | ".join(factors)
             }
-    except:
+    except Exception as e:
         return None
     return None
 
 # --- Streamlit 介面 ---
 
-st.set_page_config(page_title="Miniko 投資戰情室 V9.4", layout="wide")
+st.set_page_config(page_title="Miniko 投資戰情室 V9.6", layout="wide")
 
-st.title("📊 Miniko & 曜鼎豐 - 投資戰情室 V9.4 (價格意圖因子旗艦版)")
+st.title("📊 Miniko & 曜鼎豐 - 投資戰情室 V9.6 (機構法人旗艦版)")
 st.markdown("""
-本系統整合 **CAPM、Fama-French** 與 **Smart Beta**。
-**V9.4 核心升級：** 引入 **「價格意圖因子」**，利用數學公式篩選出「股價走直線」的主力控盤股，排除隨機漫步的雜訊。
+本系統整合 **CAPM、Fama-French** 與 **大戶品質因子 (Quality)**。
+**V9.6 核心升級：** 引入 **ROIC、FCF Yield、PEG**，透過機構法人視角，識破財務槓桿與虛胖成長。
 """)
 
 # --- 知識庫 Expander ---
-with st.expander("📚 點此查看：價格意圖因子與核心選股邏輯 (New!)"):
-    tab_intent, tab_theory, tab_chips = st.tabs(["💎 核心：價格意圖因子", "CAPM與三因子", "籌碼與CGO"])
+with st.expander("📚 點此查看：機構法人選股邏輯 (ROIC & FCF)"):
+    tab_intent, tab_theory, tab_chips = st.tabs(["💎 核心：ROIC與品質", "CAPM與三因子", "籌碼與CGO"])
     
     with tab_intent:
         st.markdown("""
-        ### 💎 什麼是「價格意圖因子」？
+        ### 💎 大戶核心：ROIC 與 FCF
         
+        **1. ROIC (投入資本回報率)**：
+        * **定義**：公司用本錢 (股東權益+負債) 賺取本業獲利的效率。
+        * **門檻**：至少要 > WACC (約 5~8%)。若 > 15% 則為頂級護城河公司。
         
-        **核心邏輯**：股價從 A 點到 B 點，距離最短的是「直線」。
-        * 如果一檔股票像**直線**一樣慢慢爬升，代表背後有**造市者或主力**在付費維護或少量吸籌，讓價格穩定。
-        * 如果一檔股票上沖下洗、路徑繞來繞去，代表多空分歧，看不出主力意圖。
+        **2. FCF Yield (自由現金流收益率)**：
+        * **定義**：`自由現金流 / 市值`。
+        * **意義**：這是您買下整間公司後，每年能拿到的真實現金回報。比本益比 (PE) 更真實，因為現金流騙不了人。
         
-        **三大篩選公式**：
-        1.  **收益率上限**：過去 60 天漲幅 < 20% (避免追高、找起漲點)。
-        2.  **變動率 (Variability)**：每日漲跌幅絕對值總和 (越小代表走勢越平滑)。
-        3.  **價格意圖** = `報酬率 / 變動率`。數值越大，代表「直線上漲」趨勢越強。
-        
-        **為什麼有效？**
-        * **風險調整後收益高**：在承擔最小波動下，獲得最穩定的報酬。
-        * **市場關注度低**：我們結合 `因子 / 交易量`，找出尚未被市場大肆炒作的低調好股。
+        **3. 價格意圖因子**：
+        * 輔助判斷：在基本面優異的前提下，尋找走勢穩定 (直線上漲) 的標的。
         """)
 
     with tab_theory:
@@ -302,15 +334,15 @@ if 'results' not in st.session_state:
 col1, col2 = st.columns([1, 4])
 
 with col1:
-    st.info("💡 系統執行：價格意圖因子篩選 + CAPM 評價 + Smart Beta 診斷。")
+    st.info("💡 系統執行：ROIC 資本效率篩選 + FCF 真實估值 + 意圖因子輔助。")
     if st.button("🚀 啟動 AI 智能運算 (Top 100)", type="primary"):
         with st.spinner("Step 1: 載入大盤數據..."):
             market_returns = get_market_data()
         
-        with st.spinner("Step 2: 全市場掃描 (計算意圖因子)..."):
+        with st.spinner("Step 2: 全市場掃描 (財務結構運算)..."):
             tickers, name_map = get_all_tw_tickers()
             
-        st.success(f"鎖定 {len(tickers)} 檔標的，開始運算股價路徑...")
+        st.success(f"鎖定 {len(tickers)} 檔標的，開始深度財務分析...")
         st.session_state['results'] = []
         
         progress_bar = st.progress(0)
@@ -338,24 +370,24 @@ with col2:
     else:
         df = pd.DataFrame(st.session_state['results'])
         
-        # 排序：優先展示「價格意圖優選」且評分高的
+        # 排序：優先展示 AI 評分高，且 ROIC 表現好的
         df = df.sort_values(by=['AI綜合評分', '意圖因子'], ascending=[False, False]).head(100)
         
-        st.subheader(f"🏆 AI 嚴選現貨清單 Top 100 (價格意圖優選)")
+        st.subheader(f"🏆 AI 嚴選現貨清單 Top 100 (機構法人觀點)")
         
         st.dataframe(
             df,
             use_container_width=True,
             hide_index=True,
-            column_order=["代號", "名稱", "現價", "AI綜合評分", "AI綜合建議", "意圖因子", "合理價", "CGO指標", "亮點"],
+            column_order=["代號", "名稱", "現價", "AI綜合評分", "AI綜合建議", "ROIC", "FCF Yield", "合理價", "亮點"],
             column_config={
                 "代號": st.column_config.TextColumn(width="small"),
                 "現價": st.column_config.NumberColumn(format="$%.2f"),
                 "AI綜合評分": st.column_config.ProgressColumn(format="%.1f", min_value=0, max_value=100),
-                "AI綜合建議": st.column_config.TextColumn(width="large", help="包含股價路徑軌跡診斷"),
-                "意圖因子": st.column_config.NumberColumn(format="%.2f", help="數值越高代表走勢越像直線(穩定)"),
+                "AI綜合建議": st.column_config.TextColumn(width="large", help="包含股價路徑與大戶財務診斷"),
+                "ROIC": st.column_config.TextColumn(help="投入資本回報率 (越高等級越高)"),
+                "FCF Yield": st.column_config.TextColumn(help="自由現金流收益率 (真實的殖利率)"),
                 "合理價": st.column_config.NumberColumn(format="$%.2f"),
-                "CGO指標": st.column_config.NumberColumn(format="%.1f%%"),
                 "亮點": st.column_config.TextColumn(width="medium"),
             }
         )
