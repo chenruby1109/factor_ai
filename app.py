@@ -6,6 +6,7 @@ import requests
 import concurrent.futures
 import twstock
 import time
+import gc  # V9.8 新增：垃圾回收機制
 
 # --- 設定區 ---
 TELEGRAM_BOT_TOKEN = '您的_BOT_TOKEN' 
@@ -27,9 +28,9 @@ def send_telegram_message(message):
 
 @st.cache_data(ttl=3600) 
 def get_market_data():
-    """下載大盤指數 (關閉內建多線程以防衝突)"""
+    """下載大盤指數"""
     try:
-        # 關鍵修正：threads=False
+        # 關鍵：threads=False 避免與主程式衝突
         market = yf.download("^TWII", period="1y", interval="1d", progress=False, threads=False)
         if isinstance(market.columns, pd.MultiIndex):
             market.columns = market.columns.get_level_values(0)
@@ -43,7 +44,6 @@ def get_all_tw_tickers():
     tickers = []
     name_map = {}
     try:
-        # 抓取上市與上櫃
         for code, info in twstock.codes.items():
             if info.type == '股票':
                 suffix = ".TW" if info.market == '上市' else ".TWO"
@@ -55,13 +55,14 @@ def get_all_tw_tickers():
         return [], {}
 
 def get_realtime_price_robust(stock_code):
-    """【V9.7】增強版價格抓取"""
+    """【V9.8】增強版價格抓取"""
     price = None
     
     # 策略 1: yfinance
     try:
         ticker = yf.Ticker(stock_code)
-        hist = ticker.history(period="5d") 
+        # 縮短 timeout 避免卡死
+        hist = ticker.history(period="5d", timeout=5) 
         if not hist.empty:
             price = float(hist['Close'].iloc[-1])
     except: pass
@@ -84,14 +85,14 @@ def get_realtime_price_robust(stock_code):
     return price
 
 def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
-    """【V9.7】核心運算：資源控管 + 決策同步"""
+    """【V9.8】核心運算：資源控管 + 決策同步"""
     try:
         current_price = get_realtime_price_robust(ticker_symbol)
         if current_price is None or current_price <= 0: return None
 
-        # V9.7 關鍵：threads=False 防止資源崩潰，timeout 防止卡死
+        # V9.8 關鍵：timeout 控制與單線程下載
         try:
-            data = yf.download(ticker_symbol, period="1y", interval="1d", progress=False, timeout=10, threads=False)
+            data = yf.download(ticker_symbol, period="1y", interval="1d", progress=False, timeout=5, threads=False)
         except:
             return None
 
@@ -99,7 +100,7 @@ def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
         if isinstance(data.columns, pd.MultiIndex):
             data.columns = data.columns.get_level_values(0)
         
-        if current_price < 10: return None # 排除雞蛋水餃股
+        if current_price < 10: return None 
 
         # --- 因子計算 ---
         stock_returns = data['Close'].pct_change().dropna()
@@ -151,7 +152,7 @@ def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
         if volatility < 0.25: score += 15; factors.append("🛡️低波")
         elif volatility > 0.5: score -= 10
 
-        # --- 買點與決策同步邏輯 (V9.4 同步版) ---
+        # --- 買點與決策同步邏輯 (消除落差感) ---
         bias_ma20 = (current_price - ma20) / ma20 
         anchor_price = ma20
         anchor_note = "MA20"
@@ -171,17 +172,18 @@ def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
         # 這裡的門檻設為 40 以確保有結果顯示
         if score >= 40: 
             if gap_percent <= 0.03: 
-                # 【同步邏輯】AI 叫買，建議價格就是現價
+                # 【同步邏輯優化】
+                # 當 AI 判斷可買，建議價格直接顯示為現價，避免使用者混淆
                 if score >= 80: ai_advice = "🚀 強力買進"
                 else: ai_advice = "✅ 建議買進"
                 final_buy_price = current_price 
-                final_buy_note = f"現價進場(防守{anchor_note})"
+                final_buy_note = f"現價進場 (防守{anchor_note})"
             else:
-                # AI 叫等，建議價格就是下方支撐
+                # 當 AI 判斷要等，建議價格顯示下方的支撐價
                 wait_percent = round(gap_percent * 100, 1)
-                ai_advice = f"📉 等回檔({wait_percent}%)"
+                ai_advice = f"📉 等回檔 ({wait_percent}%)"
                 final_buy_price = anchor_price
-                final_buy_note = f"乖離大,等{anchor_note}"
+                final_buy_note = f"乖離過大，等待{anchor_note}"
 
             return {
                 "代號": ticker_symbol.replace(".TW", "").replace(".TWO", ""), 
@@ -203,13 +205,13 @@ def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
 
 # --- Streamlit 介面 ---
 
-st.set_page_config(page_title="Miniko 投資戰情室 V9.7", layout="wide")
+st.set_page_config(page_title="Miniko 投資戰情室 V9.8", layout="wide")
 
-st.title("📊 Miniko & 曜鼎豐 - 投資戰情室 V9.7 (全市場穩定掃描版)")
+st.title("📊 Miniko & 曜鼎豐 - 投資戰情室 V9.8 (全台股穩定掃描版)")
 st.markdown("""
-**【V9.7 企業級更新】** 1. **全市場掃描**：採用「批次處理」技術，穩定掃描台股 1800+ 檔股票，解決崩潰問題。
-2. **決策零落差**：AI 建議買進時，建議買點自動同步為現價。
-**⚠️ 提示：** 掃描全市場資料量龐大，請耐心等候進度條跑完 (約需 10-15 分鐘)。
+**【V9.8 企業級更新】** 1. **穩定性核心**：導入 `gc` 記憶體回收與小批次處理，解決 1800 檔掃描時的崩潰問題。
+2. **決策直觀化**：完全消除「建議買進」與「建議價格」的視覺落差，操作更直覺。
+**⚠️ 提示：** 全市場掃描資料量巨大，請耐心等候進度條跑完 (約 10-15 分鐘)。
 """)
 
 # --- 主程式區 ---
@@ -237,35 +239,35 @@ with col1:
         progress_bar = st.progress(0)
         status_text = st.empty()
         
-        # --- V9.7 關鍵技術：批次處理 (Batch Processing) ---
-        # 解決 RuntimeError: start_new_thread 的核心
-        # 每次只處理 30 檔，處理完釋放資源，再做下一批
-        BATCH_SIZE = 30 
+        # --- V9.8 關鍵技術：批次處理 + 記憶體回收 ---
+        # 將批次縮小為 20 檔，確保穩定
+        BATCH_SIZE = 20 
         total_tickers = len(tickers)
         
-        # 使用較保守的 max_workers=4 確保穩定
+        # 使用 max_workers=4 
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
             for i in range(0, total_tickers, BATCH_SIZE):
-                # 切割出這一批要跑的股票
                 batch_tickers = tickers[i : i + BATCH_SIZE]
                 
                 # 送出這一批次
                 future_to_ticker = {executor.submit(calculate_theoretical_factors, t, name_map, market_returns): t for t in batch_tickers}
                 
-                # 等待這一批次完成
                 for future in concurrent.futures.as_completed(future_to_ticker):
                     data = future.result()
                     if data:
                         st.session_state['results'].append(data)
                 
+                # 強制執行垃圾回收，防止記憶體溢出
+                gc.collect()
+
                 # 更新進度
                 current_count = min(i + BATCH_SIZE, total_tickers)
                 progress_percent = current_count / total_tickers
                 progress_bar.progress(progress_percent)
                 status_text.text(f"🔥 AI 全力運算中... 進度: {current_count} / {total_tickers} 檔")
                 
-                # 稍微休息 0.2 秒，避免對 Yahoo Finance 發送太快被鎖 IP
-                time.sleep(0.2) 
+                # 稍微休息，保護 IP
+                time.sleep(0.1) 
 
         status_text.text("✅ 全市場掃描完成！")
 
@@ -297,9 +299,9 @@ with col2:
             column_config={
                 "代號": st.column_config.TextColumn(help="股票代碼"),
                 "現價": st.column_config.NumberColumn(format="$%.2f"),
-                "AI決策": st.column_config.TextColumn(help="AI操作建議 (同步建議買點)"),
+                "AI決策": st.column_config.TextColumn(help="AI操作建議"),
                 "AI綜合評分": st.column_config.ProgressColumn(format="%.1f", min_value=0, max_value=100),
-                "建議買點": st.column_config.NumberColumn(format="$%.2f", help="若建議買進，此價格即為現價，方便操作"),
+                "建議買點": st.column_config.NumberColumn(format="$%.2f", help="若建議買進，此價格即為現價"),
                 "合理價": st.column_config.NumberColumn(format="$%.2f"),
                 "CGO指標": st.column_config.NumberColumn(format="%.1f%%"),
                 "亮點": st.column_config.TextColumn(width="medium"),
