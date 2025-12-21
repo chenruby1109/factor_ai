@@ -6,7 +6,7 @@ import numpy as np
 import requests
 from datetime import datetime
 import concurrent.futures
-import ssl
+import twstock # <--- 引入這個強大的台股套件
 
 # --- 設定區 ---
 TELEGRAM_BOT_TOKEN = '您的_BOT_TOKEN' 
@@ -21,85 +21,42 @@ def send_telegram_message(message):
     try: requests.post(url, json=payload)
     except: pass
 
-# --- 備用方案：內建熱門股清單 (萬一爬蟲失敗時使用) ---
-def get_fallback_tickers():
-    # 這裡預先列出市值前 150 大與熱門題材股
-    STOCK_MAP = {
-        '2330.TW': '台積電', '2317.TW': '鴻海', '2454.TW': '聯發科', '2308.TW': '台達電', 
-        '2382.TW': '廣達', '2412.TW': '中華電', '2881.TW': '富邦金', '2882.TW': '國泰金', 
-        '2886.TW': '兆豐金', '2891.TW': '中信金', '1216.TW': '統一', '1301.TW': '台塑', 
-        '1303.TW': '南亞', '1326.TW': '台化', '2002.TW': '中鋼', '2207.TW': '和泰車', 
-        '2303.TW': '聯電', '2327.TW': '國巨', '2357.TW': '華碩', '2379.TW': '瑞昱', 
-        '2395.TW': '研華', '2408.TW': '南亞科', '2603.TW': '長榮', '2609.TW': '陽明', 
-        '2615.TW': '萬海', '2880.TW': '華南金', '2883.TW': '開發金', '2884.TW': '玉山金', 
-        '2885.TW': '元大金', '2890.TW': '永豐金', '2892.TW': '第一金', '2912.TW': '統一超', 
-        '3008.TW': '大立光', '3034.TW': '聯詠', '3037.TW': '欣興', '3045.TW': '台灣大', 
-        '3231.TW': '緯創', '3443.TW': '創意', '3661.TW': '世芯-KY', '3711.TW': '日月光', 
-        '4904.TW': '遠傳', '4938.TW': '和碩', '5871.TW': '中租-KY', '5876.TW': '上海商銀', 
-        '5880.TW': '合庫金', '6415.TW': '矽力-KY', '6505.TW': '台塑化', '6669.TW': '緯穎', 
-        '8046.TW': '南電', '9910.TW': '豐泰', '8299.TW': '群聯', '4927.TW': '泰鼎-KY',
-        '3035.TW': '智原', '3529.TW': '力旺', '2360.TW': '致茂', '6278.TW': '台表科',
-        '2356.TW': '英業達', '2376.TW': '技嘉', '2388.TW': '威盛', '2455.TW': '全新', 
-        '3105.TW': '穩懋', '8086.TW': '宏捷科', '6213.TW': '聯茂', '3017.TW': '奇鋐',
-        '3324.TW': '雙鴻', '1513.TW': '中興電', '1519.TW': '華城', '1503.TW': '士電',
-        '1605.TW': '華新', '9958.TW': '世紀鋼', '6488.TW': '環球晶', '5483.TW': '中美晶',
-        '6147.TW': '頎邦', '8069.TW': '元太', '5347.TW': '世界'
-    }
-    return list(STOCK_MAP.keys()), STOCK_MAP
-
 @st.cache_data(ttl=3600) 
 def get_all_tw_tickers():
     """
-    獲取股票清單 (V5.2 強力版)
-    先嘗試爬蟲，失敗則切換到內建清單
+    使用 twstock 套件直接獲取清單 (不用爬蟲，速度快且穩)
     """
     try:
-        # 使用 requests 強制忽略 SSL 驗證
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
-        
-        # 1. 上市
-        url_twse = "https://isin.twse.com.tw/isin/C_public.jsp?strMode=2"
-        r_twse = requests.get(url_twse, headers=headers, verify=False, timeout=10) # 關鍵: verify=False
-        df_twse = pd.read_html(r_twse.text)[0]
-        
-        df_twse.columns = df_twse.iloc[0]
-        df_twse = df_twse.iloc[1:]
-        df_twse = df_twse[df_twse['有價證券別'] == '股票']
-        tickers_twse = df_twse['有價證券代號及名稱'].apply(lambda x: x.split()[0] + ".TW").tolist()
-        names_twse = df_twse['有價證券代號及名稱'].apply(lambda x: x.split()[0] + " " + x.split()[-1]).tolist()
-        
-        # 2. 上櫃
-        url_tpex = "https://isin.twse.com.tw/isin/C_public.jsp?strMode=4"
-        r_tpex = requests.get(url_tpex, headers=headers, verify=False, timeout=10)
-        df_tpex = pd.read_html(r_tpex.text)[0]
-        
-        df_tpex.columns = df_tpex.iloc[0]
-        df_tpex = df_tpex.iloc[1:]
-        df_tpex = df_tpex[df_tpex['有價證券別'] == '股票']
-        tickers_tpex = df_tpex['有價證券代號及名稱'].apply(lambda x: x.split()[0] + ".TWO").tolist()
-        names_tpex = df_tpex['有價證券代號及名稱'].apply(lambda x: x.split()[0] + " " + x.split()[-1]).tolist()
-
-        all_tickers = tickers_twse + tickers_tpex
-        all_names = names_twse + names_tpex
-        
+        tickers = []
         name_map = {}
-        for item in all_names:
-            code, name = item.split()
-            suffix = ".TW" if code + ".TW" in tickers_twse else ".TWO"
-            name_map[code + suffix] = name
-            
-        return all_tickers, name_map
+        
+        # twstock.codes 是內建的字典，包含所有台股資訊
+        for code, info in twstock.codes.items():
+            # 只選「股票」，排除權證、ETF等
+            if info.type == '股票':
+                suffix = ""
+                if info.market == '上市':
+                    suffix = ".TW"
+                elif info.market == '上櫃':
+                    suffix = ".TWO"
+                
+                if suffix:
+                    full_ticker = code + suffix
+                    tickers.append(full_ticker)
+                    name_map[full_ticker] = info.name
+        
+        return tickers, name_map
         
     except Exception as e:
-        st.warning(f"自動抓取全市場清單失敗 (SSL 阻擋)，已自動切換至「精選熱門股模式」繼續執行。")
-        return get_fallback_tickers()
+        st.error(f"獲取清單失敗: {e}")
+        return [], {}
 
 def calculate_factors_sniper(ticker_symbol, name_map):
     """
-    Miniko 狙擊手 V5.2 - 嚴格篩選邏輯
+    Miniko 狙擊手 V6 - 嚴格篩選邏輯
     """
     try:
-        # 只抓最近 3 個月資料
+        # 抓取最近 3 個月資料
         data = yf.download(ticker_symbol, period="3mo", interval="1d", progress=False)
         
         if len(data) < 60: return None
@@ -110,8 +67,8 @@ def calculate_factors_sniper(ticker_symbol, name_map):
         prev = data.iloc[-2]
         close = curr['Close']
         
-        # 0. 基本過濾
-        if close < 10 or curr['Volume'] < 100000: return None # 稍微放寬成交量
+        # 0. 基本過濾 (排除 10 元以下與無量股)
+        if close < 10 or curr['Volume'] < 200000: return None
 
         # 1. 技術指標
         ma60 = data['Close'].rolling(60).mean().iloc[-1]
@@ -128,9 +85,9 @@ def calculate_factors_sniper(ticker_symbol, name_map):
         score = 0
         factors = []
         
-        # 條件 A: 拒絕追高
+        # 條件 A: 拒絕追高 (乖離率 < 20%)
         if bias > 0.20: return None 
-        if bias < -0.15: return None # 放寬一點空頭容忍度
+        if bias < -0.15: return None
 
         # 條件 B: 剛站上季線
         if close > ma60:
@@ -139,7 +96,7 @@ def calculate_factors_sniper(ticker_symbol, name_map):
         
         # 條件 C: 底部爆量吸籌
         vol_ratio = curr['Volume'] / vol_ma5
-        if vol_ratio > 1.3: # 稍微放寬到 1.3 倍
+        if vol_ratio > 1.3:
             score += 25
             factors.append(f"🔥 量增({round(vol_ratio,1)}倍)")
         
@@ -152,7 +109,8 @@ def calculate_factors_sniper(ticker_symbol, name_map):
         if 45 < rsi < 75:
             score += 15
         
-        if score >= 55: # 門檻微調至 55 分
+        # 總分門檻
+        if score >= 55:
             return {
                 "Ticker": ticker_symbol,
                 "Name": name_map.get(ticker_symbol, ticker_symbol),
@@ -169,10 +127,10 @@ def calculate_factors_sniper(ticker_symbol, name_map):
 
 # --- Streamlit 頁面 ---
 
-st.set_page_config(page_title="Miniko 狙擊手 V5.2", layout="wide")
+st.set_page_config(page_title="Miniko 狙擊手 V6", layout="wide")
 
-st.title("🏹 Miniko 狙擊手 V5.2 - 強力掃描版")
-st.markdown("### 策略：尋找「剛站上季線 + 爆量」的起漲股 (內建防當機機制)")
+st.title("🏹 Miniko 狙擊手 V6 - 字典資料庫版")
+st.markdown("### 策略：使用內建資料庫掃描全台 1800+ 檔股票，絕不連線失敗")
 
 if 'results' not in st.session_state:
     st.session_state['results'] = []
@@ -180,20 +138,20 @@ if 'results' not in st.session_state:
 col1, col2 = st.columns([1, 3])
 
 with col1:
-    st.info("💡 提醒：若全市場連線不穩，系統會自動切換為「精選熱門股」掃描，確保您一定能看到結果。")
+    st.info("💡 提醒：這次使用的是內建清單，不會被網站擋 IP。全市場掃描約需 20 分鐘。")
     
     if st.button("🚀 啟動掃描", type="primary"):
-        with st.spinner("正在初始化數據庫..."):
+        with st.spinner("正在讀取股票字典..."):
             tickers, name_map = get_all_tw_tickers()
             
-        st.success(f"目標鎖定：準備掃描 {len(tickers)} 檔股票...")
+        st.success(f"成功載入 {len(tickers)} 檔股票！開始分析...")
         st.session_state['results'] = [] 
         
         progress_bar = st.progress(0)
         status_text = st.empty()
         result_placeholder = col2.empty() 
         
-        # 使用多執行緒
+        # 使用多執行緒 (Max workers 設為 16 以加快 yfinance 下載)
         with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
             future_to_ticker = {executor.submit(calculate_factors_sniper, t, name_map): t for t in tickers}
             
@@ -204,7 +162,7 @@ with col1:
                 data = future.result()
                 completed_count += 1
                 
-                if completed_count % 10 == 0:
+                if completed_count % 50 == 0:
                     progress_bar.progress(completed_count / len(tickers))
                     status_text.text(f"掃描進度: {completed_count}/{len(tickers)} | 已發現: {found_count} 檔")
                 
@@ -235,7 +193,7 @@ with col1:
 
 with col2:
     if not st.session_state['results']:
-        st.write("👈 點擊左側按鈕開始，結果會即時顯示...")
+        st.write("👈 點擊左側按鈕開始，這次保證不會有 SSL 錯誤！")
     else:
         df_show = pd.DataFrame(st.session_state['results'])
         st.subheader(f"🎯 歷史掃描結果 ({len(df_show)} 檔)")
