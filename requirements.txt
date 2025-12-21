@@ -4,3 +4,4 @@ pandas
 ta
 numpy
 requests
+lxml
