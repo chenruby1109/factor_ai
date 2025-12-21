@@ -74,29 +74,119 @@ def get_realtime_price_robust(stock_code):
         except: pass
     return price
 
+def get_financial_metrics_deep(ticker_obj):
+    """
+    【V9.9 深層挖掘引擎】
+    如果不依賴 unstable 的 .info，直接從三大報表 (financials, balance_sheet, cashflow) 
+    挖掘原始數據並手動計算 ROIC 和 FCF。
+    """
+    metrics = {
+        'roic': None,
+        'fcf_yield': None,
+        'peg': None,
+        'pb': None,
+        'div_rate': None,
+        'ebitda': None
+    }
+    
+    try:
+        # 1. 嘗試從 info 抓取 (最快，但常失敗)
+        info = ticker_obj.info
+        metrics['pb'] = info.get('priceToBook')
+        metrics['peg'] = info.get('pegRatio')
+        metrics['div_rate'] = info.get('dividendRate')
+        
+        # 2. 深層挖掘：抓取三大報表
+        # 使用 try-except 避免某些表不存在導致 crash
+        fin = ticker_obj.financials
+        bs = ticker_obj.balance_sheet
+        cf = ticker_obj.cashflow
+        mkt_cap = info.get('marketCap')
+
+        # --- 手動計算 ROIC ---
+        # 公式: NOPAT / Invested Capital
+        # NOPAT ≈ EBIT * (1-Tax) 
+        # Invested Capital = Total Debt + Equity - Cash
+        try:
+            # 尋找 EBIT 或 Operating Income
+            ebit = None
+            if 'EBIT' in fin.index: ebit = fin.loc['EBIT'].iloc[0]
+            elif 'Operating Income' in fin.index: ebit = fin.loc['Operating Income'].iloc[0]
+            elif 'OperatingIncome' in fin.index: ebit = fin.loc['OperatingIncome'].iloc[0]
+            
+            # 尋找資本結構
+            total_debt = 0
+            if 'Total Debt' in bs.index: total_debt = bs.loc['Total Debt'].iloc[0]
+            elif 'TotalDebt' in bs.index: total_debt = bs.loc['TotalDebt'].iloc[0]
+            
+            stockholders_equity = 0
+            if 'Stockholders Equity' in bs.index: stockholders_equity = bs.loc['Stockholders Equity'].iloc[0]
+            elif 'StockholdersEquity' in bs.index: stockholders_equity = bs.loc['StockholdersEquity'].iloc[0]
+            
+            cash = 0
+            if 'Cash And Cash Equivalents' in bs.index: cash = bs.loc['Cash And Cash Equivalents'].iloc[0]
+            
+            if ebit and stockholders_equity:
+                invested_capital = total_debt + stockholders_equity - cash
+                if invested_capital > 0:
+                    # 假設稅率 20%
+                    metrics['roic'] = (ebit * 0.8) / invested_capital
+        except:
+            pass
+
+        # --- 手動計算 FCF ---
+        # 公式: Operating Cash Flow + CapEx (CapEx通常為負值)
+        try:
+            ocf = None
+            if 'Operating Cash Flow' in cf.index: ocf = cf.loc['Operating Cash Flow'].iloc[0]
+            elif 'Total Cash From Operating Activities' in cf.index: ocf = cf.loc['Total Cash From Operating Activities'].iloc[0]
+            
+            capex = 0
+            if 'Capital Expenditure' in cf.index: capex = cf.loc['Capital Expenditure'].iloc[0]
+            
+            fcf_val = None
+            # 有些 API 會直接給 Free Cash Flow
+            if 'Free Cash Flow' in cf.index: 
+                fcf_val = cf.loc['Free Cash Flow'].iloc[0]
+            elif ocf is not None:
+                fcf_val = ocf + capex
+            
+            if fcf_val and mkt_cap:
+                metrics['fcf_yield'] = fcf_val / mkt_cap
+        except:
+            pass
+            
+    except:
+        pass
+        
+    return metrics
+
 def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
     """
-    【Miniko V9.8 完美融合版】
-    邏輯：V9.7 的容錯機制 (避免抓不到資料報錯) + V9.6 的詳細文本與指標。
+    【Miniko V9.9 深層數據版】
+    改用 get_financial_metrics_deep 函數強行計算指標，解決 N/A 問題。
     """
     try:
         stock_name = name_map.get(ticker_symbol, ticker_symbol)
         current_price = get_realtime_price_robust(ticker_symbol)
         if current_price is None or current_price <= 0: return None
 
-        # 下載數據 (忽略錯誤)
+        # 下載數據
         data = yf.download(ticker_symbol, period="1y", interval="1d", progress=False)
         if len(data) < 60: return None 
         if isinstance(data.columns, pd.MultiIndex):
             data.columns = data.columns.get_level_values(0)
         
-        # 嘗試取得財報 (加入大量容錯機制)
+        # --- 啟動深層挖掘 ---
         ticker = yf.Ticker(ticker_symbol)
-        try:
-            info = ticker.info
-        except:
-            info = {} 
+        deep_metrics = get_financial_metrics_deep(ticker)
         
+        roic = deep_metrics['roic']
+        fcf_yield = deep_metrics['fcf_yield']
+        pb = deep_metrics['pb']
+        peg_ratio = deep_metrics['peg']
+        div_rate = deep_metrics['div_rate']
+
         # --- 0. 基礎趨勢與意圖因子 ---
         days = 60
         close_series = data['Close']
@@ -121,34 +211,6 @@ def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
             elif s_return < -0.05:
                 score_intent = 5 
 
-        # --- 1. 機構大戶數據 (容錯版) ---
-        
-        # ROIC
-        roic = None
-        try:
-            ebitda = info.get('ebitda')
-            total_debt = info.get('totalDebt')
-            total_cash = info.get('totalCash')
-            equity = info.get('stockholdersEquity')
-            if ebitda and total_debt and equity:
-                invested_capital = total_debt + equity - (total_cash if total_cash else 0)
-                if invested_capital > 0:
-                    roic = (ebitda * 0.8) / invested_capital
-        except: pass
-
-        # FCF Yield
-        fcf_yield = None
-        try:
-            fcf = info.get('freeCashflow')
-            mkt_cap = info.get('marketCap')
-            if fcf and mkt_cap and mkt_cap > 0:
-                fcf_yield = fcf / mkt_cap
-        except: pass
-
-        # PEG & PB
-        peg_ratio = info.get('pegRatio')
-        pb = info.get('priceToBook')
-
         # --- 2. CAPM ---
         stock_returns = close_series.pct_change().dropna()
         aligned = pd.concat([stock_returns, market_returns], axis=1, join='inner').dropna()
@@ -162,7 +224,7 @@ def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
         
         ke = RF + beta * MRP 
 
-        # --- 3. 評分系統 (混合制) ---
+        # --- 3. 評分系統 ---
         score = 0
         factors = []
         
@@ -177,7 +239,7 @@ def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
             score += score_intent
             factors.append("💎主力軌跡")
 
-        # B. 財務面
+        # B. 財務面 (深層數據)
         if roic is not None:
             if roic > 0.15: 
                 score += 25
@@ -200,16 +262,15 @@ def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
         if volatility < 0.35: score += 10
         
         # E. 估值保護
-        div_rate = info.get('dividendRate')
         fair_value = np.nan
         if div_rate:
             k_minus_g = max(ke - G_GROWTH, 0.015)
             fair_value = div_rate / k_minus_g
 
-        # --- 4. 生成詳細診斷文本 (恢復 V9.6 的詳細格式) ---
+        # --- 4. 生成詳細診斷文本 ---
         if score >= 15: 
             
-            # 數據格式化 (處理 None)
+            # 數據格式化
             roic_str = f"{roic:.1%}" if roic is not None else "N/A"
             fcf_str = f"{fcf_yield:.1%}" if fcf_yield is not None else "N/A"
             peg_str = f"{peg_ratio}" if peg_ratio else "N/A"
@@ -218,12 +279,11 @@ def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
             inst_view = ""
             if roic and roic > ke: inst_view += "✅價值創造(ROIC>Ke)"
             elif roic: inst_view += "⚠️資本效率待提升"
-            else: inst_view += "資料不足，改參考PB"
+            else: inst_view += "財報暫缺，改採PB評價"
 
             # 2. 技術觀點
             path_diagnosis = f"趨勢向上 (+{s_return:.1%})" if s_return > 0 else f"趨勢修正 ({s_return:.1%})"
             
-            # 組合最終建議 (V9.6 風格)
             final_advice = (
                 f"📊 **AI 深度解析**：\n"
                 f"1. **品質**：ROIC {roic_str} | {inst_view}\n"
@@ -236,7 +296,7 @@ def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
                 "名稱": stock_name,
                 "現價": float(current_price),
                 "AI綜合評分": round(score, 1),
-                "AI綜合建議": final_advice, # 恢復詳細文本
+                "AI綜合建議": final_advice, 
                 "意圖因子": round(intent_factor, 2), 
                 "ROIC": roic_str, 
                 "FCF Yield": fcf_str,
@@ -249,15 +309,15 @@ def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
 
 # --- Streamlit 介面 ---
 
-st.set_page_config(page_title="Miniko 投資戰情室 V9.8", layout="wide")
+st.set_page_config(page_title="Miniko 投資戰情室 V9.9", layout="wide")
 
-st.title("📊 Miniko & 曜鼎豐 - 投資戰情室 V9.8 (機構法人完全版)")
+st.title("📊 Miniko & 曜鼎豐 - 投資戰情室 V9.9 (深層挖掘版)")
 st.markdown("""
 本系統整合 **CAPM、Fama-French** 與 **大戶品質因子 (Quality)**。
-**V9.8 特點：** 結合 **ROIC 資本效率** 與 **FCF 真實估值**，並具備資料容錯機制，確保主流股與潛力股不遺漏。
+**V9.9 最終修復：** 啟用「深層挖掘 (Deep Mining)」技術，直接讀取財報原始數據並手動運算，解決資料庫缺漏問題，讓 ROIC 與 FCF 數據重見天日。
 """)
 
-# --- 知識庫 Expander (恢復 V9.6 的詳細說明) ---
+# --- 知識庫 Expander ---
 with st.expander("📚 點此查看：機構法人選股邏輯 (ROIC & FCF)"):
     tab_intent, tab_theory, tab_chips = st.tabs(["💎 核心：ROIC與品質", "CAPM與三因子", "籌碼與CGO"])
     
@@ -298,15 +358,15 @@ if 'results' not in st.session_state:
 col1, col2 = st.columns([1, 4])
 
 with col1:
-    st.info("💡 系統執行：大戶品質因子 (ROIC/FCF) + 技術面容錯掃描")
+    st.info("💡 系統執行：啟動深層報表挖掘 (Financials Mining)...")
     if st.button("🚀 啟動 AI 智能運算", type="primary"):
         with st.spinner("Step 1: 載入大盤數據..."):
             market_returns = get_market_data()
         
-        with st.spinner("Step 2: 全市場掃描 (啟動容錯機制)..."):
+        with st.spinner("Step 2: 全市場掃描 (這可能會花一點時間挖掘財報)..."):
             tickers, name_map = get_all_tw_tickers()
             
-        st.success(f"鎖定 {len(tickers)} 檔標的，開始深度分析...")
+        st.success(f"鎖定 {len(tickers)} 檔標的，開始深度挖掘...")
         st.session_state['results'] = []
         
         progress_bar = st.progress(0)
@@ -333,7 +393,7 @@ with col2:
     else:
         df = pd.DataFrame(st.session_state['results'])
         
-        # 排序：強制取出前 100 名
+        # 排序
         df = df.sort_values(by=['AI綜合評分', '意圖因子'], ascending=[False, False]).head(100)
         
         st.subheader(f"🏆 AI 嚴選現貨清單 (Top 100)")
@@ -348,7 +408,7 @@ with col2:
                 "現價": st.column_config.NumberColumn(format="$%.2f"),
                 "AI綜合評分": st.column_config.ProgressColumn(format="%.1f", min_value=0, max_value=100),
                 "AI綜合建議": st.column_config.TextColumn(width="large", help="包含大戶視角的三面向診斷"),
-                "ROIC": st.column_config.TextColumn(help="投入資本回報率 (N/A表示暫缺)"),
+                "ROIC": st.column_config.TextColumn(help="投入資本回報率 (深層挖掘版)"),
                 "FCF Yield": st.column_config.TextColumn(),
                 "合理價": st.column_config.NumberColumn(format="$%.2f"),
                 "亮點": st.column_config.TextColumn(width="medium"),
