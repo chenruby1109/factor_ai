@@ -77,7 +77,9 @@ def get_realtime_price_robust(stock_code):
 
 def get_financial_metrics_deep(ticker_obj):
     """
-    【V9.9 大戶法人旗艦版】保留原功能，增加 WACC 所需數據
+    【V9.9 大戶法人旗艦版】
+    新增提取: ROI(ROA), ROE, EPS, 淨利, 總資產, 總負債
+    新增提取: 年營收成長率, 季營收成長率
     """
     metrics = {
         'roic': None,
@@ -86,7 +88,17 @@ def get_financial_metrics_deep(ticker_obj):
         'pb': None,
         'div_rate': None,
         'total_debt': 0,      
-        'total_equity': 0     
+        'total_equity': 0,
+        # 獲利指標
+        'roe': None,
+        'roa': None, 
+        'eps': None,
+        'net_income': None, 
+        'total_assets': None, 
+        'book_value': None,
+        # 新增：營收動能
+        'rev_growth_year': None, # 年營收成長
+        'rev_growth_qr': None    # 季營收成長
     }
     
     try:
@@ -95,12 +107,21 @@ def get_financial_metrics_deep(ticker_obj):
         metrics['peg'] = info.get('pegRatio')
         metrics['div_rate'] = info.get('dividendRate')
         
+        # 獲利指標 (優先從 info 拿)
+        metrics['roe'] = info.get('returnOnEquity')
+        metrics['roa'] = info.get('returnOnAssets')
+        metrics['eps'] = info.get('trailingEps')
+        metrics['book_value'] = info.get('bookValue')
+        
+        # 營收動能 (季營收成長) - info 通常給的是最近一季 YoY
+        metrics['rev_growth_qr'] = info.get('revenueGrowth')
+
         fin = ticker_obj.financials
         bs = ticker_obj.balance_sheet
         cf = ticker_obj.cashflow
         mkt_cap = info.get('marketCap')
 
-        # WACC 數據
+        # WACC 數據 & 資產負債表數據
         total_debt = 0
         if 'Total Debt' in bs.index: total_debt = bs.loc['Total Debt'].iloc[0]
         elif 'TotalDebt' in bs.index: total_debt = bs.loc['TotalDebt'].iloc[0]
@@ -110,6 +131,29 @@ def get_financial_metrics_deep(ticker_obj):
         if 'Stockholders Equity' in bs.index: stockholders_equity = bs.loc['Stockholders Equity'].iloc[0]
         elif 'StockholdersEquity' in bs.index: stockholders_equity = bs.loc['StockholdersEquity'].iloc[0]
         metrics['total_equity'] = stockholders_equity
+
+        # 總資產
+        if 'Total Assets' in bs.index: metrics['total_assets'] = bs.loc['Total Assets'].iloc[0]
+        elif 'TotalAssets' in bs.index: metrics['total_assets'] = bs.loc['TotalAssets'].iloc[0]
+
+        # 淨利
+        if 'Net Income' in fin.index: metrics['net_income'] = fin.loc['Net Income'].iloc[0]
+        elif 'NetIncome' in fin.index: metrics['net_income'] = fin.loc['NetIncome'].iloc[0]
+
+        # 計算年營收成長率 (從財報抓取 Total Revenue)
+        try:
+            rev_series = None
+            if 'Total Revenue' in fin.index: rev_series = fin.loc['Total Revenue']
+            elif 'TotalRevenue' in fin.index: rev_series = fin.loc['TotalRevenue']
+            
+            # 確保至少有兩年的數據才能計算成長率
+            if rev_series is not None and len(rev_series) >= 2:
+                # (今年 - 去年) / 去年
+                this_year = rev_series.iloc[0]
+                last_year = rev_series.iloc[1]
+                if last_year > 0:
+                    metrics['rev_growth_year'] = (this_year - last_year) / last_year
+        except: pass
 
         # ROIC 計算
         try:
@@ -170,6 +214,19 @@ def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
         peg_ratio = deep_metrics['peg']
         div_rate = deep_metrics['div_rate']
 
+        # 獲利與財報指標
+        roe = deep_metrics['roe']
+        roa = deep_metrics['roa'] # ROI
+        eps = deep_metrics['eps']
+        book_value = deep_metrics['book_value']
+        net_income = deep_metrics['net_income']
+        total_debt = deep_metrics['total_debt']
+        total_assets = deep_metrics['total_assets']
+        
+        # 營收指標
+        rev_growth_year = deep_metrics['rev_growth_year']
+        rev_growth_qr = deep_metrics['rev_growth_qr']
+
         # 技術指標準備 (為了安全濾網)
         close_series = data['Close']
         ma60 = close_series.rolling(60).mean().iloc[-1]
@@ -179,17 +236,14 @@ def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
         # ==========================================
         
         # 1. 現金流濾網：FCF Yield < 10% (0.10) 淘汰
-        #    (從 15% 稍微下修至 10% 以避免選不到股，但仍屬於 Deep Value)
         if fcf_yield is None or fcf_yield < 0.10:
             return None
             
         # 2. 趨勢濾網 (避開價值陷阱)：股價必須在季線之上
-        #    (如果高殖利率但股價在季線下，極可能是接刀)
         if current_price < ma60:
             return None
 
         # 3. 品質濾網 (避開爛公司)：ROIC 必須大於 8%
-        #    (確保公司本業具有一定賺錢效率，非曇花一現)
         if roic is None or roic < 0.08:
             return None
         # ==========================================
@@ -209,7 +263,6 @@ def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
 
         # --- 2. WACC 計算 ---
         wacc = None
-        total_debt = deep_metrics['total_debt']
         total_equity = deep_metrics['total_equity']
         if total_equity > 0:
             total_capital = total_equity + total_debt
@@ -267,7 +320,7 @@ def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
         ma20 = close_series.rolling(20).mean().iloc[-1]
         
         if current_price > ma20: score += 20 
-        if current_price > ma60: score += 10 # 雖然前面已經濾過，這裡保留加分邏輯
+        if current_price > ma60: score += 10 
         if is_intent_candidate: 
             score += score_intent
             factors.append("💎主力軌跡")
@@ -294,7 +347,7 @@ def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
             else:
                 inst_view = "資本效率尚可"
         
-        # FCF 加分 (既然能通過篩選，FCF 肯定很高)
+        # FCF 加分
         if fcf_yield > 0.15:
             score += 30
             factors.append(f"超高現金流({fcf_yield:.1%})")
@@ -317,15 +370,32 @@ def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
             fcf_str = f"{fcf_yield:.1%}" 
             peg_str = f"{peg_ratio}" if peg_ratio else "N/A"
             wacc_str = f"{wacc:.1%}" if wacc else "N/A"
+            
+            # 數據格式化
+            roe_str = f"{roe:.1%}" if roe else "N/A"
+            roa_str = f"{roa:.1%}" if roa else "N/A"
+            eps_str = f"{eps:.2f}" if eps else "N/A"
+            
+            rev_growth_y_str = f"{rev_growth_year:.1%}" if rev_growth_year else "N/A"
+            rev_growth_q_str = f"{rev_growth_qr:.1%}" if rev_growth_qr else "N/A"
+            
+            # 簡化財報數據為易讀格式 (單位: 億/千萬)
+            def format_large_num(num):
+                if not num: return "N/A"
+                return f"{num/1e8:.1f}億"
+            
+            debt_str = format_large_num(total_debt)
+            net_income_str = format_large_num(net_income)
+            bv_str = f"{book_value:.2f}" if book_value else "N/A"
 
             path_diagnosis = f"趨勢向上 (+{s_return:.1%})" if s_return > 0 else f"趨勢修正 ({s_return:.1%})"
             
             final_advice = (
                 f"📊 **AI 深度解析**：\n"
-                f"1. **品質**：{inst_view} (已過濾掉 ROIC < 8% 之爛股)\n"
-                f"2. **估值**：FCF Yield {fcf_str} (已過濾 FCF < 10% 且趨勢向下之標的)\n"
+                f"1. **品質**：{inst_view} | ROE {roe_str} | EPS {eps_str}\n"
+                f"2. **估值**：FCF Yield {fcf_str} (已過濾 FCF < 10%)\n"
                 f"3. **技術**：{path_diagnosis} | Beta {beta:.2f} | 站穩季線\n"
-                f"4. **籌碼/風險**：CGO {cgo_status} | {'低波動 Smart Beta' if is_low_vol else '一般波動'}"
+                f"4. **風險**：CGO {cgo_status} | 負債 {debt_str}"
             )
 
             return {
@@ -339,7 +409,16 @@ def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
                 "ROIC": roic_str,     
                 "FCF Yield": fcf_str, 
                 "WACC": wacc_str,     
-                "CGO": cgo_status,    
+                "CGO": cgo_status,
+                # 顯示欄位
+                "EPS": eps_str,
+                "ROE": roe_str,
+                "ROI(ROA)": roa_str,
+                "年營收成長": rev_growth_y_str, # 新增
+                "季營收成長": rev_growth_q_str, # 新增
+                "每股淨值": bv_str,
+                "總負債": debt_str,
+                "本期淨利": net_income_str,
                 "亮點": " | ".join(factors)
             }
     except Exception as e:
@@ -353,9 +432,7 @@ st.set_page_config(page_title="Miniko 投資戰情室 V9.9", layout="wide")
 st.title("📊 Miniko  - 大戶悄悄話茶室 V9.9 (大戶法人旗艦版)")
 st.markdown("""
 本系統整合 **CAPM、Fama-French** 與 **大戶品質因子 (Quality)**。
-**V9.9 安全防禦版：** * **FCF Yield > 10%**：確保深度價值。
-* **ROIC > 8%**：確保公司體質健康，非曇花一現。
-* **Price > MA60**：確保趨勢向上，避開價值陷阱（接刀）。
+**V9.9 安全防禦版：** 嚴選 **FCF > 10%** 且 **ROIC > 8%** 之深度價值股，並加入 **營收動能、財報體質** 全面診斷。
 """)
 
 # --- 知識庫 Expander ---
@@ -388,12 +465,12 @@ if 'results' not in st.session_state:
 col1, col2 = st.columns([1, 4])
 
 with col1:
-    st.info("💡 系統執行：啟動安全防禦篩選 (FCF>10%, ROIC>8%, Price>MA60)...")
+    st.info("💡 系統執行：啟動安全防禦篩選 (含財報/營收掃描)...")
     if st.button("🚀 啟動 AI 智能運算", type="primary"):
         with st.spinner("Step 1: 載入大盤數據..."):
             market_returns = get_market_data()
         
-        with st.spinner("Step 2: 全市場掃描 (這會非常嚴格，請稍候)..."):
+        with st.spinner("Step 2: 全市場掃描 (條件嚴格，請稍候)..."):
             tickers, name_map = get_all_tw_tickers()
             
         st.success(f"鎖定 {len(tickers)} 檔標的，開始深度挖掘...")
@@ -436,7 +513,10 @@ with col2:
                 "代號", "名稱", "現價", "合理價", 
                 "AI綜合評分", "AI綜合建議", 
                 "ROIC", "FCF Yield", 
+                "EPS", "ROE", "ROI(ROA)", 
+                "年營收成長", "季營收成長", # 新增營收欄位
                 "WACC", "CGO",       
+                "每股淨值", "總負債", "本期淨利", 
                 "亮點"
             ],
             column_config={
@@ -444,11 +524,21 @@ with col2:
                 "現價": st.column_config.NumberColumn(format="$%.2f"),
                 "合理價": st.column_config.NumberColumn(format="$%.2f"),
                 "AI綜合評分": st.column_config.ProgressColumn(format="%.1f", min_value=0, max_value=100),
-                "AI綜合建議": st.column_config.TextColumn(width="large", help="包含大戶視角的三面向診斷"),
-                "ROIC": st.column_config.TextColumn(help="投入資本回報率 (>8% 品質保證)"),
-                "FCF Yield": st.column_config.TextColumn(help="自由現金流收益率 (>10%)"),
-                "WACC": st.column_config.TextColumn(help="加權平均資本成本"),
-                "CGO": st.column_config.TextColumn(help="籌碼獲利狀態"),
+                "AI綜合建議": st.column_config.TextColumn(width="large"),
+                
+                # 詳細說明欄位 (Tooltips)
+                "ROIC": st.column_config.TextColumn(help="投入資本回報率 (>8% 品質保證)：衡量公司運用資本賺錢的效率"),
+                "FCF Yield": st.column_config.TextColumn(help="自由現金流收益率 (>10%)：股東真實拿到的現金回報率，越高越便宜"),
+                "EPS": st.column_config.TextColumn(help="每股盈餘 (Earnings Per Share)：公司獲利的絕對值指標"),
+                "ROE": st.column_config.TextColumn(help="股東權益報酬率 (Return on Equity)：巴菲特愛用指標，利用股東資金獲利的能力"),
+                "ROI(ROA)": st.column_config.TextColumn(help="資產報酬率 (Return on Assets)：利用總資產獲利的能力，含槓桿因素"),
+                "年營收成長": st.column_config.TextColumn(help="年營收成長率 (Year-over-Year)：今年總營收 vs 去年總營收"),
+                "季營收成長": st.column_config.TextColumn(help="季營收成長率 (Quarterly Revenue Growth)：最近一季 vs 去年同期"),
+                "WACC": st.column_config.TextColumn(help="加權平均資本成本：公司取得資金的成本，ROIC > WACC 才是好公司"),
+                "CGO": st.column_config.TextColumn(help="籌碼獲利狀態：現價 > 市場成本(VWAP) 代表籌碼穩定"),
+                "每股淨值": st.column_config.TextColumn(help="Book Value：公司清算後的每股價值"),
+                "總負債": st.column_config.TextColumn(help="Total Debt：公司總負債金額 (單位:億)"),
+                "本期淨利": st.column_config.TextColumn(help="Net Income：公司本期稅後淨賺 (單位:億)"),
                 "亮點": st.column_config.TextColumn(width="medium"),
             }
         )
