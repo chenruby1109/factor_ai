@@ -85,8 +85,8 @@ def get_financial_metrics_deep(ticker_obj):
         'peg': None,
         'pb': None,
         'div_rate': None,
-        'total_debt': 0,      # 新增
-        'total_equity': 0     # 新增
+        'total_debt': 0,      
+        'total_equity': 0     
     }
     
     try:
@@ -170,8 +170,31 @@ def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
         peg_ratio = deep_metrics['peg']
         div_rate = deep_metrics['div_rate']
 
-        # --- 1. CAPM 與 Beta (新增) ---
+        # 技術指標準備 (為了安全濾網)
         close_series = data['Close']
+        ma60 = close_series.rolling(60).mean().iloc[-1]
+
+        # ==========================================
+        # 🛡️ 【安全防禦過濾系統】 
+        # ==========================================
+        
+        # 1. 現金流濾網：FCF Yield < 10% (0.10) 淘汰
+        #    (從 15% 稍微下修至 10% 以避免選不到股，但仍屬於 Deep Value)
+        if fcf_yield is None or fcf_yield < 0.10:
+            return None
+            
+        # 2. 趨勢濾網 (避開價值陷阱)：股價必須在季線之上
+        #    (如果高殖利率但股價在季線下，極可能是接刀)
+        if current_price < ma60:
+            return None
+
+        # 3. 品質濾網 (避開爛公司)：ROIC 必須大於 8%
+        #    (確保公司本業具有一定賺錢效率，非曇花一現)
+        if roic is None or roic < 0.08:
+            return None
+        # ==========================================
+
+        # --- 1. CAPM 與 Beta ---
         stock_returns = close_series.pct_change().dropna()
         aligned = pd.concat([stock_returns, market_returns], axis=1, join='inner').dropna()
         aligned.columns = ['Stock', 'Market']
@@ -184,7 +207,7 @@ def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
         
         ke = RF + beta * MRP 
 
-        # --- 2. WACC 計算 (新增) ---
+        # --- 2. WACC 計算 ---
         wacc = None
         total_debt = deep_metrics['total_debt']
         total_equity = deep_metrics['total_equity']
@@ -194,7 +217,7 @@ def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
             weight_debt = total_debt / total_capital
             wacc = (ke * weight_equity) + (COST_OF_DEBT_NET * weight_debt)
 
-        # --- 3. CGO 與 VWAP (新增) ---
+        # --- 3. CGO 與 VWAP ---
         df_60 = data.tail(60)
         vwap_60 = (df_60['Close'] * df_60['Volume']).sum() / df_60['Volume'].sum()
         cgo_status = ""
@@ -210,7 +233,7 @@ def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
             else:
                 cgo_status = "套牢壓力🥶"
 
-        # --- 4. Smart Beta 低波動 (新增) ---
+        # --- 4. Smart Beta 低波動 ---
         volatility = stock_returns.std() * (252**0.5)
         is_low_vol = False
         if volatility < 0.25 or (beta < 0.8 and volatility < 0.35):
@@ -226,7 +249,7 @@ def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
         
         intent_factor = 0
         score_intent = 0
-        is_intent_candidate = False # 恢復此變數
+        is_intent_candidate = False 
         
         if v_variability > 0 and avg_volume > 500: 
             raw_intent = s_return / v_variability
@@ -242,10 +265,9 @@ def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
         factors = []
         
         ma20 = close_series.rolling(20).mean().iloc[-1]
-        ma60 = close_series.rolling(60).mean().iloc[-1]
         
         if current_price > ma20: score += 20 
-        if current_price > ma60: score += 10
+        if current_price > ma60: score += 10 # 雖然前面已經濾過，這裡保留加分邏輯
         if is_intent_candidate: 
             score += score_intent
             factors.append("💎主力軌跡")
@@ -259,9 +281,9 @@ def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
             factors.append("🛡️低波動")
 
         # ROIC / WACC 判斷
-        inst_view = "" # 恢復原有變數名
+        inst_view = "" 
         if roic is not None:
-            if wacc and roic > wacc: # 加入 WACC 比較
+            if wacc and roic > wacc: 
                 score += 25
                 factors.append(f"價值創造(ROIC>WACC)")
                 inst_view = f"✅價值創造 (ROIC {roic:.1%} > WACC {wacc:.1%})"
@@ -269,21 +291,16 @@ def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
                 score += 25
                 factors.append(f"高資本效率(ROIC {roic:.1%})")
                 inst_view = "✅高資本效率"
-            elif roic > 0.08:
-                score += 15
-                inst_view = "資本效率尚可"
             else:
-                inst_view = "⚠️資本效率待提升"
-        else:
-            if pb and 0 < pb < 1.5:
-                score += 15
-                factors.append("低PB價值")
-                inst_view = "財報暫缺，改採PB評價"
+                inst_view = "資本效率尚可"
         
-        if fcf_yield is not None:
-            if fcf_yield > 0.04:
-                score += 20
-                factors.append(f"現金牛({fcf_yield:.1%})")
+        # FCF 加分 (既然能通過篩選，FCF 肯定很高)
+        if fcf_yield > 0.15:
+            score += 30
+            factors.append(f"超高現金流({fcf_yield:.1%})")
+        else:
+            score += 20
+            factors.append(f"高現金流({fcf_yield:.1%})")
 
         volatility_old = stock_returns.std() * (252**0.5)
         if volatility_old < 0.35: score += 10
@@ -294,21 +311,20 @@ def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
             k_minus_g = max(ke - G_GROWTH, 0.015)
             fair_value = div_rate / k_minus_g
 
-        # --- 生成文字 (恢復完整格式 + 插入新指標) ---
+        # --- 生成文字 ---
         if score >= 15: 
             roic_str = f"{roic:.1%}" if roic is not None else "N/A"
-            fcf_str = f"{fcf_yield:.1%}" if fcf_yield is not None else "N/A"
+            fcf_str = f"{fcf_yield:.1%}" 
             peg_str = f"{peg_ratio}" if peg_ratio else "N/A"
-            wacc_str = f"{wacc:.1%}" if wacc else "N/A" # 新增
+            wacc_str = f"{wacc:.1%}" if wacc else "N/A"
 
             path_diagnosis = f"趨勢向上 (+{s_return:.1%})" if s_return > 0 else f"趨勢修正 ({s_return:.1%})"
             
-            # 整合舊有與新資訊
             final_advice = (
                 f"📊 **AI 深度解析**：\n"
-                f"1. **品質**：{inst_view}\n"
-                f"2. **估值**：FCF Yield {fcf_str} | PEG {peg_str}\n"
-                f"3. **技術**：{path_diagnosis} | Beta {beta:.2f}\n"
+                f"1. **品質**：{inst_view} (已過濾掉 ROIC < 8% 之爛股)\n"
+                f"2. **估值**：FCF Yield {fcf_str} (已過濾 FCF < 10% 且趨勢向下之標的)\n"
+                f"3. **技術**：{path_diagnosis} | Beta {beta:.2f} | 站穩季線\n"
                 f"4. **籌碼/風險**：CGO {cgo_status} | {'低波動 Smart Beta' if is_low_vol else '一般波動'}"
             )
 
@@ -316,14 +332,14 @@ def calculate_theoretical_factors(ticker_symbol, name_map, market_returns):
                 "代號": ticker_symbol.replace(".TW", "").replace(".TWO", ""),
                 "名稱": stock_name,
                 "現價": float(current_price),
-                "合理價": round(fair_value, 2) if not np.isnan(fair_value) else 0, # 移到現價旁
+                "合理價": round(fair_value, 2) if not np.isnan(fair_value) else 0,
                 "AI綜合評分": round(score, 1),
-                "AI綜合建議": final_advice, # 恢復原本的詳細建議
+                "AI綜合建議": final_advice,
                 "意圖因子": round(intent_factor, 2), 
-                "ROIC": roic_str,     # 恢復原有欄位
-                "FCF Yield": fcf_str, # 恢復原有欄位
-                "WACC": wacc_str,     # 新增欄位
-                "CGO": cgo_status,    # 新增欄位
+                "ROIC": roic_str,     
+                "FCF Yield": fcf_str, 
+                "WACC": wacc_str,     
+                "CGO": cgo_status,    
                 "亮點": " | ".join(factors)
             }
     except Exception as e:
@@ -337,10 +353,12 @@ st.set_page_config(page_title="Miniko 投資戰情室 V9.9", layout="wide")
 st.title("📊 Miniko  - 大戶悄悄話茶室 V9.9 (大戶法人旗艦版)")
 st.markdown("""
 本系統整合 **CAPM、Fama-French** 與 **大戶品質因子 (Quality)**。
-**V9.9 最終修復：** 啟用「深層挖掘」與「風險定價模型」，包含 WACC 與 CGO 籌碼分析。
+**V9.9 安全防禦版：** * **FCF Yield > 10%**：確保深度價值。
+* **ROIC > 8%**：確保公司體質健康，非曇花一現。
+* **Price > MA60**：確保趨勢向上，避開價值陷阱（接刀）。
 """)
 
-# --- 知識庫 Expander (保留) ---
+# --- 知識庫 Expander ---
 with st.expander("📚 點此查看：機構法人選股邏輯 (ROIC & WACC)"):
     tab_intent, tab_theory, tab_chips = st.tabs(["💎 ROIC vs WACC", "CAPM與三因子", "籌碼與CGO"])
     with tab_intent:
@@ -370,12 +388,12 @@ if 'results' not in st.session_state:
 col1, col2 = st.columns([1, 4])
 
 with col1:
-    st.info("💡 系統執行：啟動深層報表挖掘 (Financials Mining)...")
+    st.info("💡 系統執行：啟動安全防禦篩選 (FCF>10%, ROIC>8%, Price>MA60)...")
     if st.button("🚀 啟動 AI 智能運算", type="primary"):
         with st.spinner("Step 1: 載入大盤數據..."):
             market_returns = get_market_data()
         
-        with st.spinner("Step 2: 全市場掃描 (WACC & CGO 運算中)..."):
+        with st.spinner("Step 2: 全市場掃描 (這會非常嚴格，請稍候)..."):
             tickers, name_map = get_all_tw_tickers()
             
         st.success(f"鎖定 {len(tickers)} 檔標的，開始深度挖掘...")
@@ -401,7 +419,7 @@ with col1:
 
 with col2:
     if not st.session_state['results']:
-        st.write("👈 請點擊左側按鈕開始分析。")
+        st.write("👈 請點擊左側按鈕開始分析。(注意：已開啟安全過濾，只會顯示趨勢向上的價值股)")
     else:
         df = pd.DataFrame(st.session_state['results'])
         
@@ -410,16 +428,15 @@ with col2:
         
         st.subheader(f"🏆 AI 嚴選現貨清單 (Top 100)")
         
-        # 這裡嚴格恢復您要求的欄位順序，並加入新欄位
         st.dataframe(
             df,
             use_container_width=True,
             hide_index=True,
             column_order=[
-                "代號", "名稱", "現價", "合理價", # 合理價移到這裡
+                "代號", "名稱", "現價", "合理價", 
                 "AI綜合評分", "AI綜合建議", 
-                "ROIC", "FCF Yield", # 恢復這兩個欄位
-                "WACC", "CGO",       # 新增這兩個欄位在後方
+                "ROIC", "FCF Yield", 
+                "WACC", "CGO",       
                 "亮點"
             ],
             column_config={
@@ -428,8 +445,8 @@ with col2:
                 "合理價": st.column_config.NumberColumn(format="$%.2f"),
                 "AI綜合評分": st.column_config.ProgressColumn(format="%.1f", min_value=0, max_value=100),
                 "AI綜合建議": st.column_config.TextColumn(width="large", help="包含大戶視角的三面向診斷"),
-                "ROIC": st.column_config.TextColumn(help="投入資本回報率 (深層挖掘版)"),
-                "FCF Yield": st.column_config.TextColumn(help="自由現金流收益率"),
+                "ROIC": st.column_config.TextColumn(help="投入資本回報率 (>8% 品質保證)"),
+                "FCF Yield": st.column_config.TextColumn(help="自由現金流收益率 (>10%)"),
                 "WACC": st.column_config.TextColumn(help="加權平均資本成本"),
                 "CGO": st.column_config.TextColumn(help="籌碼獲利狀態"),
                 "亮點": st.column_config.TextColumn(width="medium"),
